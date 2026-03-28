@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import agent; import app; print\\('OK'\\)\" 2>&1)",
+      "Bash(python -c \"import agent; import app; import renderer; print\\('OK'\\)\" 2>&1)",
+      "Bash(python -c \"import user_memory; print\\('OK'\\)\" && python -c \"from tools import TOOL_REGISTRY; print\\(list\\(TOOL_REGISTRY.keys\\(\\)\\)\\)\")",
+      "Bash(python -c \"\nfrom user_memory import save_preferences, load_preferences, format_preferences_for_prompt\nresult = save_preferences\\(pace='relaxed', group_size='solo', lunch_time='12:00', dinner_time='18:30', interests=['history', 'food']\\)\nprint\\('Save:', result\\)\nprefs = load_preferences\\(\\)\nprint\\('Load:', prefs\\)\nprint\\('Prompt:', format_preferences_for_prompt\\(prefs\\)\\)\n\")",
+      "Bash(grep -r \"image\\\\|photo\\\\|Picture\\\\|img\" /Users/jasper/Desktop/CSCI3280/Projects/travel-agent --include=\"*.py\" --include=\"*.js\" 2>/dev/null | head -20)"
+    ]
+  }
+}

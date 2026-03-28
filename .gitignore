@@ -1,0 +1,12 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.wav
+*.mp3
+*.ogg
+temp_audio/
+static/audio/
+user_preferences.json
+.DS_Store
+PLAN.md

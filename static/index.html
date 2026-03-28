@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI Travel Agent</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Playfair+Display:wght@600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/style.css?v=15" />
+</head>
+<body>
+
+  <!-- ── Sidebar ── -->
+  <aside class="sidebar">
+    <div class="logo-row">
+      <div class="logo">
+        <span class="logo-icon">✈</span>
+        <span class="logo-text">TravelAI</span>
+      </div>
+      <button class="btn-theme-toggle" id="btn-theme" title="Toggle light/dark mode">
+        <span id="theme-icon">☀</span>
+      </button>
+    </div>
+    <nav class="nav">
+      <button class="nav-item active" data-panel="chat">
+        <span class="nav-icon">💬</span> Chat
+      </button>
+      <button class="nav-item" data-panel="itinerary">
+        <span class="nav-icon">🗓</span> Itinerary
+        <span class="badge" id="itinerary-badge" hidden></span>
+      </button>
+    </nav>
+    <div class="trip-section">
+      <div class="trip-section-header">My Trips</div>
+      <div class="trip-list" id="trip-list"></div>
+    </div>
+    <!-- Preferences editor -->
+    <div class="prefs-section" id="prefs-section">
+      <div class="prefs-toggle" id="prefs-toggle">
+        <span>Preferences</span>
+        <span class="prefs-arrow" id="prefs-arrow">▸</span>
+      </div>
+      <div class="prefs-panel" id="prefs-panel" hidden>
+        <div class="prefs-field">
+          <label>Pace</label>
+          <select id="pref-pace">
+            <option value="">Not set</option>
+            <option value="relaxed">Relaxed</option>
+            <option value="moderate">Moderate</option>
+            <option value="packed">Packed</option>
+          </select>
+        </div>
+        <div class="prefs-field">
+          <label>Interests</label>
+          <div class="prefs-checks" id="pref-interests">
+            <label><input type="checkbox" value="history"> History</label>
+            <label><input type="checkbox" value="food"> Food</label>
+            <label><input type="checkbox" value="nature"> Nature</label>
+            <label><input type="checkbox" value="shopping"> Shopping</label>
+            <label><input type="checkbox" value="art"> Art</label>
+            <label><input type="checkbox" value="nightlife"> Nightlife</label>
+          </div>
+        </div>
+        <div class="prefs-field prefs-times">
+          <div>
+            <label>Lunch</label>
+            <input type="time" id="pref-lunch" value="12:00" />
+          </div>
+          <div>
+            <label>Dinner</label>
+            <input type="time" id="pref-dinner" value="18:00" />
+          </div>
+        </div>
+        <button class="btn-save-prefs" id="btn-save-prefs">Save</button>
+      </div>
+    </div>
+
+    <div class="sidebar-footer">
+      <button class="btn-new-trip" id="btn-new-trip" title="Start a new trip">
+        <span>+</span> New Trip
+      </button>
+      <button class="btn-delete-trip" id="btn-delete-trip" title="Delete current trip">
+        <span>🗑</span> Delete Trip
+      </button>
+    </div>
+  </aside>
+
+  <!-- ── Main ── -->
+  <main class="main">
+
+    <!-- Chat Panel -->
+    <section class="panel" id="panel-chat">
+      <header class="panel-header">
+        <h1>Plan your next adventure</h1>
+        <p class="subtitle">Ask me to plan a trip, check the weather, or find attractions</p>
+      </header>
+
+      <div class="messages" id="messages"></div>
+
+      <!-- Input bar -->
+      <div class="input-bar">
+        <button class="btn-mic" id="btn-mic" title="Hold to record">
+          <span class="mic-icon">🎙</span>
+          <span class="mic-ripple"></span>
+        </button>
+        <div class="input-wrap">
+          <textarea
+            id="input-text"
+            class="input-text"
+            placeholder="Ask me to plan your trip…"
+            rows="1"
+            autocomplete="off"
+          ></textarea>
+        </div>
+        <button class="btn-send" id="btn-send" title="Send">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+            <line x1="22" y1="2" x2="11" y2="13" />
+            <polygon points="22 2 15 22 11 13 2 9 22 2" />
+          </svg>
+        </button>
+      </div>
+    </section>
+
+    <!-- Itinerary Panel -->
+    <section class="panel panel--hidden" id="panel-itinerary">
+      <header class="panel-header">
+        <h1>Your Itinerary</h1>
+        <p class="subtitle" id="itinerary-subtitle">No itinerary yet — ask me to plan a trip!</p>
+      </header>
+      <div class="itinerary-container" id="itinerary-container">
+        <div class="empty-state">
+          <div class="empty-icon">🗺</div>
+          <p>Your itinerary will appear here once you ask me to plan a trip.</p>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- Audio player (hidden) -->
+  <audio id="tts-audio" hidden></audio>
+
+  <!-- Global stop-TTS button (floating, visible on all panels) -->
+  <button class="btn-stop-tts" id="btn-stop-tts" title="Stop speaking" hidden>
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+      <rect x="6" y="6" width="12" height="12" rx="2" />
+    </svg>
+    <span>Stop</span>
+  </button>
+
+  <!-- Mobile bottom nav -->
+  <nav class="mobile-nav" id="mobile-nav">
+    <button class="mobile-nav-item active" data-panel="chat">
+      <span>💬</span><span>Chat</span>
+    </button>
+    <button class="mobile-nav-item" data-panel="itinerary">
+      <span>🗓</span><span>Itinerary</span>
+      <span class="badge mobile-badge" id="mobile-itinerary-badge" hidden></span>
+    </button>
+    <button class="mobile-nav-item" id="mobile-btn-new">
+      <span>+</span><span>New Trip</span>
+    </button>
+  </nav>
+
+  <!-- Recording overlay -->
+  <div class="recording-overlay" id="recording-overlay" hidden>
+    <div class="recording-modal">
+      <div class="recording-waves">
+        <span></span><span></span><span></span><span></span><span></span>
+      </div>
+      <p>Listening…</p>
+      <button class="btn-stop-rec" id="btn-stop-rec">Stop</button>
+    </div>
+  </div>
+
+  <script src="/static/app.js?v=15"></script>
+</body>
+</html>

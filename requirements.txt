@@ -1,0 +1,10 @@
+google-genai
+edge-tts
+openai-whisper
+fastapi
+uvicorn[standard]
+python-multipart
+python-dotenv
+requests
+pydantic
+tavily-python
