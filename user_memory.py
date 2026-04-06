@@ -96,14 +96,15 @@ def format_preferences_for_prompt(prefs: dict) -> str:
 
 def load_memories() -> list[dict]:
     """Load all saved memories. Returns list of {id, text, created_at}."""
-    if not _MEMORIES_FILE.exists():
-        return []
-    try:
-        with open(_MEMORIES_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError) as e:
-        logger.warning("Failed to load memories: %s", e)
-        return []
+    with _lock:
+        if not _MEMORIES_FILE.exists():
+            return []
+        try:
+            with open(_MEMORIES_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning("Failed to load memories: %s", e)
+            return []
 
 
 def _persist_memories(memories: list[dict]) -> None:
@@ -128,7 +129,7 @@ def save_memory(text: str) -> dict:
         memories.append(entry)
         _persist_memories(memories)
         logger.info("Saved memory: %s", text)
-        return {"status": "saved", "memory": entry}
+        return {"status": "saved", "memory": entry, "note": "Memory saved. Continue with the current task — do NOT re-ask for information the user already provided."}
 
 
 def delete_memory(memory_id: str) -> dict:

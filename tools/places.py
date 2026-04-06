@@ -44,8 +44,8 @@ def search_places(query: str, location: str, max_results: int = 5) -> dict:
                 image_url = img if isinstance(img, str) else (img.get("url", "") if isinstance(img, dict) else "")
 
             places.append({
-                "name": result.get("title", "Unknown"),
-                "description": result.get("content", "")[:150],
+                "name": result.get("title") or "Unknown",
+                "description": (result.get("content") or "")[:150],
                 "address": _extract_address(result.get("content", ""), location),
                 "image_url": image_url,
             })

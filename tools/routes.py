@@ -1,6 +1,7 @@
 """Routing tool — OSRM for walk/bike/drive, estimated transit via OSRM fallback."""
 
 import logging
+import threading
 import time
 import requests
 
@@ -9,6 +10,7 @@ logger = logging.getLogger(__name__)
 # Geocoding cache — avoids repeated Nominatim lookups and rate limits
 _geocode_cache: dict[str, tuple[float, float]] = {}
 _last_nominatim_call = 0.0
+_nominatim_lock = threading.Lock()
 
 # Modes that get an estimated transit result via OSRM driving fallback
 _TRANSIT_MODES = {"transit", "subway", "bus"}
@@ -46,11 +48,12 @@ def _geocode(location: str, city_hint: str = "") -> tuple[float, float]:
 
     for query in queries:
         try:
-            # Nominatim rate limit: max 1 req/sec
-            elapsed = time.time() - _last_nominatim_call
-            if elapsed < 1.1:
-                time.sleep(1.1 - elapsed)
-            _last_nominatim_call = time.time()
+            # Nominatim rate limit: max 1 req/sec (lock ensures no concurrent violation)
+            with _nominatim_lock:
+                elapsed = time.time() - _last_nominatim_call
+                if elapsed < 1.1:
+                    time.sleep(1.1 - elapsed)
+                _last_nominatim_call = time.time()
 
             resp = requests.get(
                 "https://nominatim.openstreetmap.org/search",

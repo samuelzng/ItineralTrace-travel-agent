@@ -668,7 +668,7 @@ async function sendMessage(text) {
           messagesEl.appendChild(buildAgentBubble(resp, true));
           scrollToBottom();
 
-          if (resp.type === 'itinerary') {
+          if (resp.type === 'itinerary' && resp.data) {
             trip.itineraries.push(resp.data);
             trip.name = resp.data.destination || trip.name;
             renderItinerary();

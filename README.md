@@ -1,169 +1,231 @@
-# AI Travel Agent
+<p align="center">
+  <img src="assets/cover.png" alt="ItineraTrace — Agentic Travel Planner" width="100%">
+</p>
 
-A multimodal AI travel planning agent built for CSCI3280 (Introduction to Multimedia). Accepts voice, text, and image input; calls live APIs to find real places; and returns a structured itinerary with text-to-speech narration.
+<p align="center">
+  <strong>Trace the Thinking. Shape the Journey.</strong><br>
+  A multimodal AI travel planning agent with voice, vision, and memory.
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/python-3.10+-blue?logo=python&logoColor=white" alt="Python">
+  <img src="https://img.shields.io/badge/LLM-Gemini%203.1%20Flash%20Lite-4285F4?logo=google&logoColor=white" alt="Gemini">
+  <img src="https://img.shields.io/badge/STT-Whisper-74aa9c?logo=openai&logoColor=white" alt="Whisper">
+  <img src="https://img.shields.io/badge/TTS-Edge--TTS-0078D4?logo=microsoft&logoColor=white" alt="Edge-TTS">
+  <img src="https://img.shields.io/badge/framework-FastAPI-009688?logo=fastapi&logoColor=white" alt="FastAPI">
+</p>
+
+---
+
+## Overview
+
+**ItineraTrace** is an agentic AI travel planner that goes beyond simple chatbot Q&A. It autonomously searches for real places, checks live weather, computes walking routes, and assembles a structured day-by-day itinerary — all through an iterative ReAct reasoning loop.
+
+It accepts **voice**, **text**, and **image** input, responds with **speech** and a rich **visual itinerary**, and **remembers** your preferences across trips.
+
+Built as a solo final project for **CSCI3280 — Introduction to Multimedia**.
+
+---
 
 ## Features
 
-- **Voice + Text I/O** — speak or type your request; responses are played back via TTS
-- **Image input** — upload or paste (Ctrl+V) a photo of a landmark; the agent identifies it and plans around it
-- **Attraction photos** — itinerary activity cards show real photos from search results
-- **ReAct agent loop** — Gemini LLM reasons step-by-step and calls tools until the itinerary is complete
-- **Zero hallucination** — every recommended place comes from a live Tavily web search
-- **Weather-aware** — checks the 16-day forecast and adapts activity suggestions accordingly
-- **Realistic routing** — computes walking/transit distances between all stops in one batch call
-- **Flexible memory** — agent learns preferences naturally from conversation (dietary needs, travel companions, style); user can view, add, and delete memories in the sidebar
-- **Multiple itineraries per trip** — ask for a second destination in the same chat; both itineraries are preserved
-- **Dark/light theme** — toggle in the sidebar; persisted across sessions
-- **Mobile-friendly** — bottom nav, responsive layout
+### Multimodal Input & Output
+
+| Input | Output |
+|-------|--------|
+| Text chat | Structured itinerary with photos |
+| Voice recording (Whisper STT) | Text-to-speech narration (Edge-TTS) |
+| Image upload / paste (landmark recognition) | Real-time progress streaming (SSE) |
+
+### Agentic Planning (ReAct Loop)
+
+- Gemini LLM reasons step-by-step, calling tools iteratively (up to 15 rounds)
+- **Zero hallucination** — every place comes from a live Tavily web search
+- **Weather-aware** — fetches 16-day forecasts; suggests indoor venues on rainy days
+- **Realistic routing** — computes walking distances between stops via OSRM
+- Structured JSON itinerary with times, durations, transport, and photos
+
+### Dynamic Memory
+
+- The agent **learns naturally** from conversation ("I'm vegetarian", "traveling with kids")
+- Memories persist across trips and are injected into the system prompt
+- View, add, and delete memories from the sidebar panel
+- No forms — preferences are captured through natural dialogue
+
+### Image Recognition
+
+- Upload or paste a photo of any landmark
+- Gemini Vision identifies the location and plans a trip around it
+- Supports JPEG, PNG, GIF, and WebP
+
+### Multi-Trip Management
+
+- Create and switch between multiple trips in a single session
+- Each trip preserves its own chat history and itinerary
+- Multiple itineraries per trip (ask for a second destination mid-chat)
+
+### Polished UI
+
+- Dark / light theme toggle (persisted in localStorage)
+- Smart suggestion chips that adapt to conversation context
+- Inline forms for destination, dates, pace, and interests
+- Responsive layout with mobile bottom navigation
+- Floating stop button for TTS playback
+
+---
 
 ## Architecture
 
 ```
-User (Voice/Text/Image)
-      │
-      ▼
-  STT (Whisper)          ◄──── /transcribe
-  Image upload           ◄──── /upload-image
-      │
-      ▼
-  Agent (Gemini + ReAct loop)
-      │  iterates up to 15 times
-      ├─── search_places        → Tavily API (+ images)
-      ├─── get_weather          → Open-Meteo (free)
-      ├─── get_batch_directions → OSRM + Nominatim (free)
-      ├─── save_user_preferences → user_preferences.json
-      └─── save_memory          → user_memories.json
-      │
-      ▼
-  Renderer (JSON normaliser)
-      │
-      ▼
-  TTS (edge-tts)
-      │
-      ▼
-  FastAPI → Browser
+User (Voice / Text / Image)
+        │
+        ▼
+   ┌─────────┐
+   │ Whisper  │  STT        ──── /transcribe
+   │ Upload   │  Image      ──── /upload-image
+   └────┬─────┘
+        ▼
+   ┌──────────────────────────────────┐
+   │  Gemini 3.1 Flash Lite (ReAct)  │
+   │  up to 15 iterations            │
+   │                                  │
+   │  ┌─ search_places  → Tavily     │
+   │  ├─ get_weather    → Open-Meteo │
+   │  ├─ get_directions → OSRM       │
+   │  └─ save_memory    → JSON store │
+   └────────────┬─────────────────────┘
+                ▼
+   ┌─────────────────────┐
+   │  Renderer + TTS     │
+   │  JSON → Timeline UI │
+   │  Summary → Audio    │
+   └────────┬────────────┘
+            ▼
+        Browser (FastAPI + SSE)
 ```
+
+---
 
 ## Tech Stack
 
-| Layer | Technology |
-|-------|-----------|
-| LLM | Gemini 3.1 Flash Lite Preview (`gemini-3.1-flash-lite-preview`) |
-| STT | OpenAI Whisper (base, local) |
-| TTS | edge-tts (free, no API key) |
-| Places search | Tavily API (`include_images=True`) |
-| Weather | Open-Meteo (free, no API key) |
-| Routing | OSRM via routing.openstreetmap.de (free) |
-| Geocoding | Nominatim / OpenStreetMap (free) |
-| Backend | FastAPI + Uvicorn |
-| Frontend | Vanilla HTML / CSS / JS (MediaRecorder for voice) |
+| Component | Technology | Cost |
+|-----------|-----------|------|
+| **LLM** | Gemini 3.1 Flash Lite Preview | Free tier |
+| **STT** | OpenAI Whisper (base, local) | Free |
+| **TTS** | Edge-TTS | Free |
+| **Places** | Tavily API (with images) | Free tier (1k req/mo) |
+| **Weather** | Open-Meteo | Free |
+| **Routing** | OSRM + Nominatim | Free |
+| **Backend** | FastAPI + Uvicorn | — |
+| **Frontend** | Vanilla HTML / CSS / JS | — |
 
-## Project Structure
+---
 
-```
-travel-agent/
-├── agent.py              # Gemini ReAct loop, tool dispatch, multimodal input, JSON parsing
-├── app.py                # FastAPI — /chat, /transcribe, /upload-image, /memories, /session
-├── config.py             # env var loading (GEMINI_API_KEY, TAVILY_API_KEY)
-├── renderer.py           # JSON normaliser — adds image_url, safe defaults
-├── stt.py                # Whisper wrapper (lazy-loaded)
-├── tts.py                # edge-tts async synthesizer
-├── user_memory.py        # Structured preferences + freeform memory (save/load/delete)
-├── tools/
-│   ├── __init__.py       # TOOL_REGISTRY
-│   ├── places.py         # search_places() — Tavily (with image_url per result)
-│   ├── weather.py        # get_weather() — Open-Meteo
-│   └── routes.py         # get_directions(), get_batch_directions() — OSRM
-├── static/
-│   ├── index.html        # Single-page UI (sidebar, chat, itinerary panels)
-│   ├── style.css         # Dark/light theme, timeline, memory panel, image styles
-│   ├── app.js            # Voice recording, image upload/paste, memory panel, fetch
-│   ├── audio/            # TTS output (auto-cleaned, gitignored)
-│   └── uploads/          # Temporary image uploads (auto-cleaned, gitignored)
-├── requirements.txt
-└── tests/
-```
+## Getting Started
 
-## Setup
+### Prerequisites
 
-### 1. Install dependencies
+- Python 3.10+
+- A [Gemini API key](https://aistudio.google.com/) (free Flash Lite tier)
+- A [Tavily API key](https://tavily.com/) (free tier)
+
+### Install
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. Create `.env`
+### Configure
+
+Create a `.env` file in the project root:
 
 ```env
-GOOGLE_API_KEY=your_gemini_api_key_here
-TAVILY_API_KEY=your_tavily_api_key_here
+GOOGLE_API_KEY=your_gemini_key
+TAVILY_API_KEY=your_tavily_key
 ```
 
-- **Gemini key**: [Google AI Studio](https://aistudio.google.com/) — use the free Flash Lite tier
-- **Tavily key**: [Tavily](https://tavily.com/) — free tier, 1000 requests/month
+Weather (Open-Meteo) and routing (OSRM/Nominatim) require no API keys.
 
-Weather (Open-Meteo) and routing (OSRM) require no API keys.
-
-### 3. Run
+### Run
 
 ```bash
 python app.py
 ```
 
-Open [http://localhost:8000](http://localhost:8000).
+Open **http://localhost:8000**.
 
-## Testing Individual Modules
+---
 
-```bash
-python tools/places.py          # Tavily place search (with images)
-python tools/weather.py         # Open-Meteo forecast
-python tools/routes.py          # OSRM directions
-python stt.py test_audio.wav    # Whisper transcription
-python tts.py "Hello world"     # edge-tts synthesis
-python agent.py                 # Full agent with text input
+## Project Structure
+
 ```
+travel-agent/
+├── agent.py            # ReAct loop, system prompt, tool dispatch, multimodal input
+├── app.py              # FastAPI endpoints, SSE streaming, session management
+├── config.py           # Environment variable loading
+├── renderer.py         # JSON normalizer (safe defaults, image passthrough)
+├── stt.py              # Whisper STT wrapper (lazy-loaded)
+├── tts.py              # Edge-TTS async synthesis
+├── user_memory.py      # Freeform memory persistence (save / load / delete)
+├── tools/
+│   ├── __init__.py     # TOOL_REGISTRY
+│   ├── places.py       # Tavily search with image URLs
+│   ├── weather.py      # Open-Meteo forecast + planning hints
+│   └── routes.py       # OSRM routing + Nominatim geocoding
+├── static/
+│   ├── index.html      # Single-page UI (sidebar + chat + itinerary)
+│   ├── style.css       # Dark/light theme, timeline, responsive layout
+│   ├── app.js          # Voice, image upload, memory panel, rendering
+│   ├── audio/          # TTS output (auto-cleaned)
+│   └── uploads/        # Temp image uploads (auto-cleaned)
+├── assets/
+│   └── cover.png       # README cover image
+└── requirements.txt
+```
+
+---
+
+## API Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/chat` | Main agent chat (SSE streaming) |
+| `POST` | `/transcribe` | Audio → text via Whisper |
+| `POST` | `/upload-image` | Upload image for recognition |
+| `GET` | `/memories` | List all saved memories |
+| `POST` | `/memories` | Add a memory manually |
+| `DELETE` | `/memories/{id}` | Delete a memory |
+| `DELETE` | `/session/{id}` | Clear conversation history |
+
+---
 
 ## How It Works
 
-1. **Input** — user types, records voice, or uploads/pastes an image
-2. **STT** — Whisper transcribes audio to text (runs in a thread, non-blocking)
-3. **Image** — if an image is attached, Gemini vision identifies the landmark; the agent searches and plans around it
-4. **Agent loop** — Gemini receives the message and iteratively:
-   - Calls `search_places` 2–3 times for different categories (attractions, restaurants, etc.)
-   - Calls `get_weather` for the travel dates
-   - Calls `get_batch_directions` once with all route legs
-   - Calls `save_memory` when the user reveals personal preferences
-   - Optionally calls `save_user_preferences` for structured pace/interest data
-5. **Itinerary** — agent emits structured JSON; each activity includes an `image_url` from Tavily
-6. **Rendering** — the renderer normalises the JSON; the frontend renders an HTML timeline with hero photos
-7. **TTS** — edge-tts narrates a human-friendly summary
-8. **Response** — browser receives text, structured data, and an audio URL simultaneously
+1. **Input** — User types, speaks, or uploads an image
+2. **STT** — Whisper transcribes audio in a background thread
+3. **Vision** — If an image is attached, Gemini identifies the landmark
+4. **Agent loop** — Gemini iterates through tool calls:
+   - `search_places` for attractions, restaurants, cafes
+   - `get_weather` for the travel dates
+   - `get_batch_directions` for all route legs
+   - `save_memory` when user reveals preferences
+5. **Itinerary** — Agent emits structured JSON with times, photos, transport
+6. **Rendering** — Frontend renders a visual timeline with activity cards
+7. **TTS** — Edge-TTS narrates a human-friendly summary
+8. **Response** — Browser receives text, itinerary data, and audio via SSE
 
-## Memory System
-
-The agent learns about the user naturally during conversation — no forms to fill in. When the user reveals something relevant ("I'm vegetarian", "traveling with two kids", "prefer boutique hotels"), the agent calls `save_memory` to store a short freeform note.
-
-Memories are shown in the **Memory** section of the sidebar. Users can:
-- View all saved memories
-- Delete any memory with ×
-- Manually add a memory via the text input
-
-All memories are injected into the agent's system prompt context for every subsequent trip.
-
-## Design Decisions
-
-- **Tavily over Google Places** — no billing setup; `include_images=True` gives free photo URLs
-- **OSRM over Google Directions** — completely free, sufficient accuracy for city-level routing
-- **Batch directions** — one `get_batch_directions` call replaces N individual calls, staying within the 15-iteration agent budget
-- **Freeform memory over rigid preferences** — preferences like "loves spicy food" or "hates crowds" are impossible to express in a dropdown; freeform text is more expressive and personalised
-- **Whisper base** — fast enough for demo use; larger models trade speed for accuracy
-- **Vanilla JS** — full control over UI without a framework; MediaRecorder gives direct mic access
-- **edge-tts** — zero config, many voices, async, and free
+---
 
 ## Limitations
 
-- Whisper `base` model may struggle with heavy accents or background noise
-- Tavily image URLs are third-party and may occasionally be broken (gracefully hidden via `onerror`)
-- OSRM routing covers most of the world but may have gaps in rural areas
-- The Gemini Flash Lite free tier is capped at 500 requests/day
-- Image identification accuracy depends on Gemini vision — very obscure locations may not be recognised
+- Whisper `base` may struggle with heavy accents or noisy environments
+- Tavily image URLs are third-party and may occasionally break (hidden via `onerror`)
+- OSRM routing has limited coverage in very rural areas
+- Gemini Flash Lite free tier: 500 requests/day
+- Very obscure landmarks may not be recognized by Gemini Vision
+
+---
+
+## License
+
+Academic project — CSCI3280 Introduction to Multimedia, CUHK.

@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import os
 import tempfile
 import threading
 import time
@@ -29,20 +30,32 @@ BASE_DIR = Path(__file__).parent
 _BOOT_ID = str(uuid.uuid4())
 
 
+_BOOT_MARKER = Path(tempfile.gettempdir()) / "travel_agent_boot_marker"
+_BOOT_MARKER_MAX_AGE = 1800  # 30 minutes — treat stale marker as cold start
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Each server start assumes a fresh user — clear prefs and old audio."""
-    prefs_file = BASE_DIR / "user_preferences.json"
-    memories_file = BASE_DIR / "user_memories.json"
-    if prefs_file.exists():
-        prefs_file.unlink()
-        logger.info("Cleared user_preferences.json for fresh session")
-    if memories_file.exists():
-        memories_file.unlink()
-        logger.info("Cleared user_memories.json for fresh session")
+    """Startup — clear user data on fresh start, but not on hot-reload."""
+    is_reload = False
+    if _BOOT_MARKER.exists():
+        age = time.time() - _BOOT_MARKER.stat().st_mtime
+        is_reload = age < _BOOT_MARKER_MAX_AGE
+
+    if not is_reload:
+        for f in (BASE_DIR / "user_preferences.json", BASE_DIR / "user_memories.json"):
+            if f.exists():
+                f.unlink()
+                logger.info("Cleared %s for fresh session", f.name)
+
+    # Touch marker for reload detection
+    _BOOT_MARKER.write_text(str(os.getpid()))
+
     # Pre-load Whisper model in background so first STT call is fast
     asyncio.get_event_loop().run_in_executor(None, _preload_whisper)
     yield
+    # Cleanup marker on shutdown so next `python app.py` is a fresh start
+    _BOOT_MARKER.unlink(missing_ok=True)
 
 
 app = FastAPI(title="AI Travel Agent", lifespan=lifespan)
@@ -380,10 +393,13 @@ def _tts_text(raw_text: str, itinerary: dict | None) -> str:
 
 if __name__ == "__main__":
     import uvicorn
+    import sys
+    is_dev = "--dev" in sys.argv
     uvicorn.run(
         "app:app",
         host="0.0.0.0",
         port=8000,
-        reload=True,
-        reload_excludes=["static/audio/*", "static/uploads/*", "*.json"],
+        reload=is_dev,
+        reload_includes=["*.py"] if is_dev else None,
+        reload_excludes=[".*"] if is_dev else None,
     )

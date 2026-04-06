@@ -1,5 +1,6 @@
 """Core agent — Gemini LLM with ReAct tool-calling loop."""
 
+import concurrent.futures
 import json
 import logging
 import threading
@@ -75,6 +76,24 @@ __USER_MEMORIES__
    - Practical tips (best photo spots, what to order, which exhibits to see)
    - NEVER mention weather negatively in descriptions (no "without getting wet", "escape the rain", etc.). Instead, describe what makes the venue itself great.
 
+═══ MODIFYING AN EXISTING ITINERARY ═══
+
+*** CHECK THIS FIRST — before preference gathering or planning ***
+
+If the conversation ALREADY contains a generated itinerary (you can see it in the conversation history), and the user sends a follow-up message like:
+- Dietary restrictions: "I don't eat spicy food", "I'm vegetarian", "no seafood"
+- Preference changes: "add more shopping", "I want a slower pace", "skip museums"
+- Specific requests: "swap dinner to a different restaurant", "add a night market"
+- General feedback: "looks great but...", "can you change..."
+
+Then you MUST:
+1. Save relevant info as a memory (e.g. save_memory("Does not eat spicy food"))
+2. Re-generate the itinerary for the SAME destination and dates, incorporating the feedback
+3. You may call search_places again if you need different options (e.g. non-spicy restaurants)
+4. Do NOT ask for destination, days, pace, or interests again — you already have all of that
+
+NEVER start the new-user flow if an itinerary was already generated in this conversation.
+
 ═══ PREFERENCE GATHERING ═══
 
 NEVER use emojis — the response will be read aloud by TTS.
@@ -102,9 +121,10 @@ Step 2 — PACE & INTERESTS (combine into ONE question, ONLY if no preferences s
 
 RULES:
 - MAXIMUM 2 questions before planning starts. Never more.
-- If the user says "just plan", "skip", "go ahead", "surprise me": IMMEDIATELY use defaults (moderate pace, mix of everything) and START PLANNING.
+- If the user says "just plan", "skip", "go ahead", "surprise me": IMMEDIATELY use defaults (moderate pace, mix of everything) and START PLANNING. Do NOT ask any more questions.
 - Do NOT ask about group size, budget, or dietary.
 - NEVER re-ask pace or interests if they are already in USER PREFERENCES.
+- *** NEVER RE-ASK FOR INFO ALREADY GIVEN ***: If the user already told you the destination and/or number of days earlier in THIS conversation, you MUST remember it. Do NOT ask again, even after tool calls like save_memory. Read back through the conversation history before asking any question.
 
 ═══ DATE HANDLING ═══
 
@@ -249,6 +269,27 @@ _TOOL_PROGRESS: dict[str, Callable[[dict], str]] = {
 }
 
 
+def _pick_initial_progress(user_message: str, history: list) -> str:
+    """Choose a contextual initial progress message based on conversation state."""
+    msg = user_message.lower().strip()
+    turn_count = len([c for c in history if getattr(c, 'role', None) == 'user'])
+
+    # User giving days/dates
+    if any(w in msg for w in ["day", "days", "天", "week"]) or msg.isdigit():
+        return "Setting up your trip..."
+
+    # User giving pace/interest or saying "just go"
+    if any(w in msg for w in ["relax", "moderate", "packed", "mix", "history", "food", "nature", "shopping",
+                               "just go", "go ahead", "skip", "surprise"]):
+        return "Preparing your itinerary..."
+
+    # Later turns in the conversation (modifications, follow-ups)
+    if turn_count > 3:
+        return "Working on your request..."
+
+    return "Understanding your request..."
+
+
 def run_agent(
     user_message: str,
     conversation_history: list | None = None,
@@ -292,6 +333,13 @@ def run_agent(
     conversation_history.append(
         types.Content(role="user", parts=user_parts)
     )
+
+    # Initial progress message so the user sees activity immediately
+    if progress_callback:
+        if image_bytes:
+            progress_callback("Analyzing your image...")
+        else:
+            progress_callback(_pick_initial_progress(user_message, conversation_history))
 
     for i in range(MAX_ITERATIONS):
         if cancel_event and cancel_event.is_set():
@@ -348,7 +396,7 @@ def run_agent(
         if not function_calls:
             # No tool calls — final text response
             if progress_callback and i > 0:
-                progress_callback("Putting it all together...")
+                progress_callback("Building your itinerary...")
             text = parts[0].text if parts and parts[0].text else ""
             if not text:
                 logger.warning("Gemini returned empty text response")
@@ -372,7 +420,12 @@ def run_agent(
                 result = {"error": f"Unknown tool: {fc.name}"}
             else:
                 try:
-                    result = tool_fn(**args)
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                        future = executor.submit(tool_fn, **args)
+                        result = future.result(timeout=15)
+                except concurrent.futures.TimeoutError:
+                    logger.error("Tool %s timed out after 15s", fc.name)
+                    result = {"error": "Tool timed out"}
                 except Exception as e:
                     logger.error("Tool %s failed: %s", fc.name, e)
                     result = {"error": str(e)}
@@ -409,7 +462,23 @@ def _parse_final_response(text: str) -> dict:
         itinerary = json.loads(clean)
         return {"text": text, "itinerary": itinerary}
     except (json.JSONDecodeError, ValueError):
-        return {"text": text, "itinerary": None}
+        pass
+
+    # Handle text followed by bare JSON (no code fences):
+    # Find the first '{' and try parsing from there to each '}' from the end
+    start = clean.find("{")
+    if start != -1:
+        # Search backwards for the matching closing brace
+        for end in range(len(clean) - 1, start, -1):
+            if clean[end] == "}":
+                try:
+                    itinerary = json.loads(clean[start:end + 1])
+                    if isinstance(itinerary, dict) and ("days" in itinerary or "destination" in itinerary):
+                        return {"text": text, "itinerary": itinerary}
+                except (json.JSONDecodeError, ValueError):
+                    continue
+
+    return {"text": text, "itinerary": None}
 
 
 # --- Standalone test ---
