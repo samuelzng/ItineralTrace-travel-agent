@@ -6,7 +6,7 @@
   <title>AI Travel Agent</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Playfair+Display:wght@600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/style.css?v=15" />
+  <link rel="stylesheet" href="/static/style.css?v=20" />
 </head>
 <body>
 
@@ -34,44 +34,21 @@
       <div class="trip-section-header">My Trips</div>
       <div class="trip-list" id="trip-list"></div>
     </div>
-    <!-- Preferences editor -->
-    <div class="prefs-section" id="prefs-section">
-      <div class="prefs-toggle" id="prefs-toggle">
-        <span>Preferences</span>
-        <span class="prefs-arrow" id="prefs-arrow">▸</span>
+    <!-- Memory panel -->
+    <div class="memory-section" id="memory-section">
+      <div class="memory-toggle" id="memory-toggle">
+        <span>Memory</span>
+        <span class="memory-count" id="memory-count" hidden>0</span>
+        <span class="prefs-arrow" id="memory-arrow">▸</span>
       </div>
-      <div class="prefs-panel" id="prefs-panel" hidden>
-        <div class="prefs-field">
-          <label>Pace</label>
-          <select id="pref-pace">
-            <option value="">Not set</option>
-            <option value="relaxed">Relaxed</option>
-            <option value="moderate">Moderate</option>
-            <option value="packed">Packed</option>
-          </select>
+      <div class="memory-panel" id="memory-panel" hidden>
+        <div class="memory-list" id="memory-list">
+          <div class="memory-empty">No memories yet. I'll learn your preferences as we chat.</div>
         </div>
-        <div class="prefs-field">
-          <label>Interests</label>
-          <div class="prefs-checks" id="pref-interests">
-            <label><input type="checkbox" value="history"> History</label>
-            <label><input type="checkbox" value="food"> Food</label>
-            <label><input type="checkbox" value="nature"> Nature</label>
-            <label><input type="checkbox" value="shopping"> Shopping</label>
-            <label><input type="checkbox" value="art"> Art</label>
-            <label><input type="checkbox" value="nightlife"> Nightlife</label>
-          </div>
+        <div class="memory-add">
+          <input type="text" class="memory-add-input" id="memory-add-input" placeholder="Add a memory..." />
+          <button class="memory-add-btn" id="memory-add-btn" title="Add">+</button>
         </div>
-        <div class="prefs-field prefs-times">
-          <div>
-            <label>Lunch</label>
-            <input type="time" id="pref-lunch" value="12:00" />
-          </div>
-          <div>
-            <label>Dinner</label>
-            <input type="time" id="pref-dinner" value="18:00" />
-          </div>
-        </div>
-        <button class="btn-save-prefs" id="btn-save-prefs">Save</button>
       </div>
     </div>
 
@@ -98,12 +75,20 @@
       <div class="messages" id="messages"></div>
 
       <!-- Input bar -->
+      <input type="file" id="image-input" accept="image/*" hidden />
       <div class="input-bar">
         <button class="btn-mic" id="btn-mic" title="Hold to record">
           <span class="mic-icon">🎙</span>
           <span class="mic-ripple"></span>
         </button>
+        <button class="btn-upload" id="btn-upload" title="Upload an image">
+          <span>📷</span>
+        </button>
         <div class="input-wrap">
+          <div class="image-preview-bar" id="image-preview-bar" hidden>
+            <img id="image-preview-thumb" class="image-preview-thumb" />
+            <button class="image-preview-remove" id="image-preview-remove" title="Remove image">&times;</button>
+          </div>
           <textarea
             id="input-text"
             class="input-text"
@@ -173,6 +158,6 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=15"></script>
+  <script src="/static/app.js?v=20"></script>
 </body>
 </html>

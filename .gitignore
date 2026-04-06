@@ -8,6 +8,8 @@ __pycache__/
 temp_audio/
 static/audio/
 user_preferences.json
+user_memories.json
 .DS_Store
 PLAN.md
 .claude/
+static/uploads/

@@ -1,40 +1,57 @@
-"""Routing tool using OSRM (free, no API key needed)."""
+"""Routing tool — OSRM for walk/bike/drive, estimated transit via OSRM fallback."""
 
 import logging
+import time
 import requests
 
 logger = logging.getLogger(__name__)
 
-# routing.openstreetmap.de uses separate subdomains per profile
+# Geocoding cache — avoids repeated Nominatim lookups and rate limits
+_geocode_cache: dict[str, tuple[float, float]] = {}
+_last_nominatim_call = 0.0
+
+# Modes that get an estimated transit result via OSRM driving fallback
+_TRANSIT_MODES = {"transit", "subway", "bus"}
+
+# ── OSRM (walk / bike / drive — free, no key) ───────────────────────────────
+
 OSRM_PROFILES = {
-    "walk":    ("routed-foot",  "foot"),
-    "bike":    ("routed-bike",  "bike"),
-    "drive":   ("routed-car",   "driving"),
-    "transit": ("routed-car",   "driving"),  # no transit — use driving as estimate
+    "walk":  ("routed-foot", "foot"),
+    "bike":  ("routed-bike", "bike"),
+    "drive": ("routed-car",  "driving"),
 }
 
 
 def _geocode(location: str, city_hint: str = "") -> tuple[float, float]:
-    """Resolve address/place name to lat/lng via Nominatim.
+    """Resolve address/place name to lat/lng via Nominatim (cached, rate-limited)."""
+    global _last_nominatim_call
+    import re
 
-    Tries multiple strategies: exact query, with city hint, structured search,
-    and progressively simplified versions of the address.
-    """
-    queries = [location]
+    cache_key = f"{location}|{city_hint}".lower()
+    if cache_key in _geocode_cache:
+        return _geocode_cache[cache_key]
+
+    queries = []
     if city_hint:
         queries.append(f"{location}, {city_hint}")
+    queries.append(location)
     # Strip leading numbers (street numbers often confuse Nominatim for Chinese addresses)
-    import re
     stripped = re.sub(r'^\d+\s+', '', location)
     if stripped != location:
         queries.append(f"{stripped}, {city_hint}" if city_hint else stripped)
-    # Try just the district + city (e.g. "Nanshan District, Shenzhen")
+    # Try just the district + city
     district_match = re.search(r'([\w\s]+District)', location)
     if district_match and city_hint:
         queries.append(f"{district_match.group(1)}, {city_hint}")
 
     for query in queries:
         try:
+            # Nominatim rate limit: max 1 req/sec
+            elapsed = time.time() - _last_nominatim_call
+            if elapsed < 1.1:
+                time.sleep(1.1 - elapsed)
+            _last_nominatim_call = time.time()
+
             resp = requests.get(
                 "https://nominatim.openstreetmap.org/search",
                 params={"q": query, "format": "json", "limit": 1},
@@ -44,14 +61,16 @@ def _geocode(location: str, city_hint: str = "") -> tuple[float, float]:
             resp.raise_for_status()
             results = resp.json()
             if results:
-                return float(results[0]["lat"]), float(results[0]["lon"])
+                coords = (float(results[0]["lat"]), float(results[0]["lon"]))
+                _geocode_cache[cache_key] = coords
+                return coords
         except requests.RequestException:
             continue
     raise ValueError(f"Cannot geocode: {location}")
 
 
-def _route_single(origin: str, destination: str, mode: str, city_hint: str = "") -> dict:
-    """Compute a single route leg between two places."""
+def _route_osrm(origin: str, destination: str, mode: str, city_hint: str = "") -> dict:
+    """Compute a single route leg via OSRM."""
     orig_lat, orig_lng = _geocode(origin, city_hint)
     dest_lat, dest_lng = _geocode(destination, city_hint)
 
@@ -73,9 +92,6 @@ def _route_single(origin: str, destination: str, mode: str, city_hint: str = "")
     distance_km = round(route["distance"] / 1000, 2)
     duration_min = round(route["duration"] / 60)
 
-    if mode in ("transit", "subway", "bus"):
-        duration_min = round(duration_min * 1.5)
-
     return {
         "origin": origin,
         "destination": destination,
@@ -86,13 +102,28 @@ def _route_single(origin: str, destination: str, mode: str, city_hint: str = "")
     }
 
 
+# ── Unified routing ──────────────────────────────────────────────────────────
+
+def _route_single(origin: str, destination: str, mode: str, city_hint: str = "") -> dict:
+    """Route a single leg via OSRM; transit modes get an estimated result."""
+    # OSRM for walk/bike/drive; transit modes fall back to drive estimate
+    result = _route_osrm(origin, destination, mode if mode in OSRM_PROFILES else "drive", city_hint)
+    # If this was a transit mode, adjust the estimate and mark it
+    if mode in _TRANSIT_MODES:
+        result["mode"] = mode
+        result["duration_min"] = round(result["duration_min"] * 1.5)
+        result["summary"] = f"~{result['duration_min']} min by {mode} ({result['distance_km']} km) [estimated]"
+        result["estimated"] = True
+    return result
+
+
 def get_directions(origin: str, destination: str, mode: str = "walk") -> dict:
     """Get directions between two places.
 
     Args:
         origin:      Starting place name or address
         destination: Ending place name or address
-        mode:        "walk" | "drive" | "bike" | "transit"
+        mode:        "walk" | "drive" | "bike" | "subway" | "bus" | "transit" | "taxi"
 
     Returns:
         {"origin": str, "destination": str, "mode": str,
@@ -154,5 +185,9 @@ def get_batch_directions(legs: list[dict], city: str = "") -> dict:
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.DEBUG)
-    result = get_directions("Shinjuku, Tokyo", "Shibuya, Tokyo", mode="walk")
-    print(result["summary"])
+    # Test walk (OSRM)
+    r1 = get_directions("Shinjuku, Tokyo", "Shibuya, Tokyo", mode="walk")
+    print("Walk:", r1["summary"])
+    # Test transit (estimated via OSRM)
+    r2 = get_directions("Shinjuku, Tokyo", "Asakusa, Tokyo", mode="subway")
+    print("Subway:", r2["summary"])

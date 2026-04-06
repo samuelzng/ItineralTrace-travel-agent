@@ -26,15 +26,28 @@ def search_places(query: str, location: str, max_results: int = 5) -> dict:
             search_depth="advanced",
             max_results=max_results,
             include_answer=True,
+            include_images=True,
         )
 
+        # Build a map of per-result image URLs (from result metadata)
+        # Tavily also returns a top-level "images" list
+        top_images = response.get("images") or []
+
         places = []
-        for result in response.get("results", []):
+        for idx, result in enumerate(response.get("results", [])):
+            # Try per-result image first, fall back to top-level images list
+            image_url = ""
+            if result.get("image_url"):
+                image_url = result["image_url"]
+            elif idx < len(top_images):
+                img = top_images[idx]
+                image_url = img if isinstance(img, str) else (img.get("url", "") if isinstance(img, dict) else "")
+
             places.append({
                 "name": result.get("title", "Unknown"),
-                "description": result.get("content", "")[:300],
-                "url": result.get("url", ""),
+                "description": result.get("content", "")[:150],
                 "address": _extract_address(result.get("content", ""), location),
+                "image_url": image_url,
             })
 
         summary = response.get("answer", "")

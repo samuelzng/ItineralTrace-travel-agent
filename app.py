@@ -2,17 +2,19 @@
 
 import asyncio
 import logging
-import os
 import tempfile
 import threading
 import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 
+import json as json_mod
+
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 import agent as travel_agent
 import renderer
@@ -21,24 +23,34 @@ from tts import synthesize
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="AI Travel Agent")
+BASE_DIR = Path(__file__).parent
 
 # Unique ID per server process — lets the client detect restarts
 _BOOT_ID = str(uuid.uuid4())
 
 
-@app.on_event("startup")
-async def _reset_on_startup():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     """Each server start assumes a fresh user — clear prefs and old audio."""
     prefs_file = BASE_DIR / "user_preferences.json"
+    memories_file = BASE_DIR / "user_memories.json"
     if prefs_file.exists():
         prefs_file.unlink()
         logger.info("Cleared user_preferences.json for fresh session")
+    if memories_file.exists():
+        memories_file.unlink()
+        logger.info("Cleared user_memories.json for fresh session")
+    # Pre-load Whisper model in background so first STT call is fast
+    asyncio.get_event_loop().run_in_executor(None, _preload_whisper)
+    yield
 
-BASE_DIR = Path(__file__).parent
+
+app = FastAPI(title="AI Travel Agent", lifespan=lifespan)
 STATIC_DIR = BASE_DIR / "static"
 AUDIO_DIR = STATIC_DIR / "audio"
+UPLOAD_DIR = STATIC_DIR / "uploads"
 AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
@@ -53,9 +65,20 @@ _cancel_events: dict[str, threading.Event] = {}
 
 # ── Models ─────────────────────────────────────────────────────────────────────
 
+def _preload_whisper():
+    """Load Whisper model at startup so first transcription is fast."""
+    try:
+        from stt import _get_model
+        _get_model()
+        logger.info("Whisper model pre-loaded")
+    except Exception as e:
+        logger.warning("Whisper pre-load failed (will retry on first use): %s", e)
+
+
 class ChatRequest(BaseModel):
-    message: str
+    message: str = Field(..., max_length=2000)
     session_id: str = ""
+    image_id: str = ""
 
 
 class ChatResponse(BaseModel):
@@ -82,49 +105,102 @@ async def index():
     return FileResponse(STATIC_DIR / "index.html")
 
 
-@app.post("/chat", response_model=ChatResponse)
+@app.post("/chat")
 async def chat(req: ChatRequest):
-    """Process a text message through the agent and return response + TTS audio."""
+    """Process a text message — streams progress events via SSE, then final response."""
     session_id = req.session_id or str(uuid.uuid4())
     history = _sessions.setdefault(session_id, [])
 
     logger.info("[%s] User: %s", session_id, req.message)
 
-    # Create a cancel event for this request (replaces any prior one for this session)
     cancel_event = threading.Event()
     _cancel_events[session_id] = cancel_event
 
-    # Run synchronous agent in a thread to avoid blocking the event loop
-    try:
-        result = await asyncio.to_thread(
-            travel_agent.run_agent, req.message, history, cancel_event
-        )
-    except travel_agent.AgentCancelled:
-        logger.info("[%s] Agent cancelled", session_id)
-        raise HTTPException(status_code=499, detail="Request cancelled")
-    finally:
+    # Load image bytes if an image was uploaded
+    image_bytes = None
+    image_mime = "image/jpeg"
+    if req.image_id:
+        img_path = UPLOAD_DIR / req.image_id
+        if img_path.exists() and img_path.parent == UPLOAD_DIR:
+            image_bytes = img_path.read_bytes()
+            suffix = img_path.suffix.lower()
+            mime_map = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                        ".gif": "image/gif", ".webp": "image/webp"}
+            image_mime = mime_map.get(suffix, "image/jpeg")
+
+    def _sse(event: str, data: dict) -> str:
+        return f"data: {json_mod.dumps({'event': event, **data})}\n\n"
+
+    async def event_stream():
+        loop = asyncio.get_running_loop()
+        progress_q: asyncio.Queue[str | None] = asyncio.Queue()
+        result_holder: dict = {}
+
+        def on_progress(msg: str):
+            loop.call_soon_threadsafe(progress_q.put_nowait, msg)
+
+        def run_agent_sync():
+            try:
+                result_holder["result"] = travel_agent.run_agent(
+                    req.message, history, cancel_event,
+                    image_bytes, image_mime, on_progress,
+                )
+            except Exception as e:
+                result_holder["error"] = e
+            finally:
+                loop.call_soon_threadsafe(progress_q.put_nowait, None)
+
+        agent_thread = threading.Thread(target=run_agent_sync, daemon=True)
+        agent_thread.start()
+
+        # Stream progress events until agent finishes
+        while True:
+            msg = await progress_q.get()
+            if msg is None:
+                break
+            yield _sse("progress", {"text": msg})
+
+        agent_thread.join()
         _cancel_events.pop(session_id, None)
 
-    text = result.get("text", "")
-    itinerary = result.get("itinerary")
-    structured = renderer.render(result)
+        # Handle errors
+        if "error" in result_holder:
+            err = result_holder["error"]
+            if isinstance(err, travel_agent.AgentCancelled):
+                yield _sse("error", {"text": "Request cancelled"})
+            else:
+                logger.error("[%s] Agent error: %s", session_id, err)
+                yield _sse("error", {"text": str(err)})
+            return
 
-    # Generate TTS for the response
-    tts_text = _tts_text(text, itinerary)
-    audio_filename = f"{uuid.uuid4()}.mp3"
-    audio_path = str(AUDIO_DIR / audio_filename)
-    await synthesize(tts_text, audio_path)
-    audio_url = f"/static/audio/{audio_filename}"
+        result = result_holder["result"]
+        text = result.get("text", "")
+        itinerary = result.get("itinerary")
+        structured = renderer.render(result)
 
-    logger.info("[%s] Response ready (type=%s)", session_id, structured["type"])
+        # TTS (non-blocking on failure)
+        tts_text = _tts_text(text, itinerary)
+        audio_url = ""
+        if tts_text.strip():
+            yield _sse("progress", {"text": "Generating audio..."})
+            try:
+                audio_filename = f"{uuid.uuid4()}.mp3"
+                audio_path = str(AUDIO_DIR / audio_filename)
+                await synthesize(tts_text, audio_path)
+                audio_url = f"/static/audio/{audio_filename}"
+            except Exception as e:
+                logger.warning("TTS failed (non-fatal): %s", e)
 
-    _cleanup_old_audio()
+        logger.info("[%s] Response ready (type=%s)", session_id, structured["type"])
+        _cleanup_old_audio()
 
-    return ChatResponse(
-        response=structured,
-        audio_url=audio_url,
-        session_id=session_id,
-    )
+        yield _sse("done", {
+            "response": structured,
+            "audio_url": audio_url,
+            "session_id": session_id,
+        })
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @app.post("/transcribe", response_model=TranscribeResponse)
@@ -142,10 +218,25 @@ async def transcribe(audio: UploadFile = File(...)):
         logger.error("STT failed: %s", e)
         raise HTTPException(status_code=500, detail=f"Transcription failed: {e}")
     finally:
-        os.unlink(tmp_path)
+        Path(tmp_path).unlink(missing_ok=True)
 
     logger.info("Transcribed: %s", text)
     return TranscribeResponse(text=text)
+
+
+@app.post("/upload-image")
+async def upload_image(image: UploadFile = File(...)):
+    """Save an uploaded image and return its ID for use in /chat."""
+    suffix = Path(image.filename or "image.jpg").suffix or ".jpg"
+    if suffix.lower() not in (".jpg", ".jpeg", ".png", ".gif", ".webp"):
+        raise HTTPException(status_code=400, detail="Unsupported image format")
+    image_id = f"{uuid.uuid4()}{suffix}"
+    dest = UPLOAD_DIR / image_id
+    dest.write_bytes(await image.read())
+    logger.info("Uploaded image: %s", image_id)
+    # Clean up old uploads (>5 min)
+    _cleanup_old_uploads()
+    return {"image_id": image_id, "url": f"/static/uploads/{image_id}"}
 
 
 @app.get("/preferences")
@@ -162,6 +253,31 @@ async def set_preferences(req: Request):
     data = await req.json()
     result = save_preferences(**data)
     return result
+
+
+@app.get("/memories")
+async def get_memories():
+    """Return all saved user memories."""
+    from user_memory import load_memories
+    return load_memories()
+
+
+@app.post("/memories")
+async def add_memory(req: Request):
+    """Manually add a memory."""
+    from user_memory import save_memory
+    data = await req.json()
+    text = data.get("text", "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Memory text is required")
+    return save_memory(text)
+
+
+@app.delete("/memories/{memory_id}")
+async def remove_memory(memory_id: str):
+    """Delete a memory by ID."""
+    from user_memory import delete_memory
+    return delete_memory(memory_id)
 
 
 @app.delete("/session/{session_id}")
@@ -184,6 +300,17 @@ def _cleanup_old_audio(max_age: int = _AUDIO_MAX_AGE):
     for f in AUDIO_DIR.glob("*.mp3"):
         try:
             if max_age == 0 or (now - f.stat().st_mtime) > max_age:
+                f.unlink()
+        except OSError:
+            pass
+
+
+def _cleanup_old_uploads(max_age: int = 300):
+    """Remove uploaded images older than max_age seconds."""
+    now = time.time()
+    for f in UPLOAD_DIR.iterdir():
+        try:
+            if f.is_file() and (now - f.stat().st_mtime) > max_age:
                 f.unlink()
         except OSError:
             pass
@@ -253,4 +380,10 @@ def _tts_text(raw_text: str, itinerary: dict | None) -> str:
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(
+        "app:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+        reload_excludes=["static/audio/*", "static/uploads/*", "*.json"],
+    )

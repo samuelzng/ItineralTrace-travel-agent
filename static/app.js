@@ -16,6 +16,8 @@ let chatAbortController = null;
 let mediaRecorder = null;
 let audioChunks = [];
 let _sendGeneration = 0;
+let pendingImageId = null;    // image_id from /upload-image
+let pendingImageUrl = null;   // local preview URL
 
 /* ── DOM refs ──────────────────────────────────────────────────────────────── */
 const messagesEl        = document.getElementById('messages');
@@ -32,6 +34,11 @@ const navItems          = document.querySelectorAll('.nav-item');
 const mobileNavItems    = document.querySelectorAll('.mobile-nav-item[data-panel]');
 const mobileBadge       = document.getElementById('mobile-itinerary-badge');
 const mobileNewBtn      = document.getElementById('mobile-btn-new');
+const imageInput        = document.getElementById('image-input');
+const btnUpload         = document.getElementById('btn-upload');
+const imagePreviewBar   = document.getElementById('image-preview-bar');
+const imagePreviewThumb = document.getElementById('image-preview-thumb');
+const imagePreviewRemove= document.getElementById('image-preview-remove');
 const panels            = { chat: document.getElementById('panel-chat'), itinerary: document.getElementById('panel-itinerary') };
 const btnNewTrip        = document.getElementById('btn-new-trip');
 const btnDeleteTrip     = document.getElementById('btn-delete-trip');
@@ -59,12 +66,18 @@ function renderAllMessages() {
   scrollToBottom();
 }
 
-function buildUserBubble(text) {
+function buildUserBubble(content) {
   const div = document.createElement('div');
   div.className = 'message message--user';
+  // content can be a string or {text, image_url}
+  const text = typeof content === 'string' ? content : content.text;
+  const imgUrl = typeof content === 'object' ? content.image_url : null;
+  const imgHtml = imgUrl
+    ? `<img src="${esc(imgUrl)}" class="message__image" loading="lazy" onerror="this.style.display='none'" />`
+    : '';
   div.innerHTML = `
     <div class="message__avatar">👤</div>
-    <div class="message__bubble"><p>${esc(text)}</p></div>`;
+    <div class="message__bubble">${imgHtml}<p>${esc(text)}</p></div>`;
   return div;
 }
 
@@ -107,7 +120,7 @@ const PREFS_CONFIRM_CHIPS = [
  */
 function _textOf(content) {
   if (typeof content === 'string') return content;
-  if (typeof content === 'object') return content.data || '';
+  if (typeof content === 'object') return content.data || content.text || '';
   return '';
 }
 
@@ -135,13 +148,26 @@ function detectChips(content) {
   if (/saved preferences|your preferences/.test(lower)) return PREFS_CONFIRM_CHIPS;
 
   // Step 1: Agent asking for destination & days
-  if (/where.*go|where.*like|how many days|destination/.test(lower) && !/pace|relaxed|interest|cuisine/.test(lower)) return '__DESTINATION_FORM__';
+  const asksWhere = /where.*go|where.*like to|what.*destination/.test(lower);
+  const asksDays = /how many days|how long|number of days/.test(lower);
+  if ((asksWhere || asksDays) && !/pace|relaxed|interest|cuisine/.test(lower)) {
+    if (asksDays && !asksWhere) {
+      // Agent already knows destination — only ask for days
+      return '__DAYS_ONLY_FORM__';
+    }
+    return '__DESTINATION_FORM__';
+  }
 
-  // Step 2: Agent asking about PACE
-  if (/pace|relaxed.*packed|packed.*relaxed/.test(lower) && !/interest|cuisine|nature|shopping/.test(lower)) return PACE_CHIPS;
+  // Combined: Agent asking about PACE AND interests in one question
+  const asksPace = /pace|relaxed.*moderate.*packed|relaxed.*packed/.test(lower);
+  const asksInterest = /interest|history.*food.*nature|food.*nature.*shopping/.test(lower);
+  if (asksPace && asksInterest) return '__PACE_AND_INTEREST__';
 
-  // Step 3: Agent asking about INTERESTS
-  if (/interest|cuisine|food.*nature|history.*culture|what.*into/.test(lower) && !/pace|relaxed.*packed/.test(lower)) return INTEREST_CHIPS;
+  // Step 2: Agent asking about PACE only
+  if (asksPace && !asksInterest) return PACE_CHIPS;
+
+  // Step 3: Agent ASKING about interests only
+  if (asksInterest && !asksPace) return INTEREST_CHIPS;
 
   // Agent asking about meal times
   if (/lunch.*dinner|meal\s*time/.test(lower)) return MEAL_CHIPS;
@@ -149,8 +175,28 @@ function detectChips(content) {
   return null;
 }
 
+function _buildDaysRow() {
+  return `
+    <div class="inline-form-row">
+      <label>How many days?</label>
+      <div class="inline-days-row">
+        <button class="chip chip--day" data-days="1">1</button>
+        <button class="chip chip--day" data-days="2">2</button>
+        <button class="chip chip--day" data-days="3">3</button>
+        <input type="number" class="inline-input inline-days-input" id="inline-days" min="1" max="30" placeholder="other" />
+      </div>
+    </div>`;
+}
+
 function _buildChipsOrForm(detected) {
   if (!detected) return '';
+  if (detected === '__DAYS_ONLY_FORM__') {
+    return `
+      <div class="inline-form" data-days-only="true">
+        ${_buildDaysRow()}
+        <button class="btn-inline-submit" id="inline-submit" disabled>Let's go</button>
+      </div>`;
+  }
   if (detected === '__DESTINATION_FORM__') {
     return `
       <div class="inline-form">
@@ -158,15 +204,17 @@ function _buildChipsOrForm(detected) {
           <label>Destination</label>
           <input type="text" class="inline-input" id="inline-dest" placeholder="e.g. Hong Kong, Tokyo, Paris" />
         </div>
-        <div class="inline-form-row">
-          <label>How many days?</label>
-          <div class="inline-days-row">
-            <button class="chip chip--day" data-days="1">1</button>
-            <button class="chip chip--day" data-days="2">2</button>
-            <button class="chip chip--day" data-days="3">3</button>
-            <input type="number" class="inline-input inline-days-input" id="inline-days" min="1" max="30" placeholder="other" />
-          </div>
-        </div>
+        ${_buildDaysRow()}
+        <button class="btn-inline-submit" id="inline-submit" disabled>Let's go</button>
+      </div>`;
+  }
+  if (detected === '__PACE_AND_INTEREST__') {
+    const paceHtml = PACE_CHIPS.map(s => `<button class="chip chip--pick" data-group="pace">${esc(s)}</button>`).join('');
+    const interestHtml = INTEREST_CHIPS.map(s => `<button class="chip chip--pick" data-group="interest">${esc(s)}</button>`).join('');
+    return `
+      <div class="inline-form" data-combo="pace-interest">
+        <div class="inline-form-row"><label>Pace</label><div class="inline-chips">${paceHtml}</div></div>
+        <div class="inline-form-row"><label>Interests</label><div class="inline-chips">${interestHtml}</div></div>
         <button class="btn-inline-submit" id="inline-submit" disabled>Let's go</button>
       </div>`;
   }
@@ -207,69 +255,105 @@ function buildAgentBubble(content, isLast) {
     <div class="message__avatar">✈</div>
     <div class="message__bubble">${bubbleHtml}${interactiveHtml}</div>`;
 
-  // Wire up chip clicks
-  div.querySelectorAll('.chip:not(.chip--day)').forEach(btn => {
+  // Wire up simple chip clicks (exclude .chip--pick used in combo forms)
+  div.querySelectorAll('.chip:not(.chip--day):not(.chip--pick)').forEach(btn => {
     btn.addEventListener('click', () => {
       document.querySelectorAll('.inline-chips').forEach(el => el.remove());
       sendMessage(btn.textContent);
     });
   });
 
-  // Wire up destination form
+  // Wire up destination/days form
   const inlineForm = div.querySelector('.inline-form');
   if (inlineForm) {
-    const destInput = inlineForm.querySelector('#inline-dest');
-    const daysInput = inlineForm.querySelector('#inline-days');
+    const isCombo = !!inlineForm.dataset.combo;
+    const isDaysOnly = inlineForm.dataset.daysOnly === 'true';
+    const destInput = inlineForm.querySelector('#inline-dest');  // null when days-only
+    const daysInput = inlineForm.querySelector('#inline-days');  // null in combo forms
     const submitBtn = inlineForm.querySelector('#inline-submit');
 
-    function getDays() {
-      // Prefer the typed number; fall back to selected chip
-      const typed = parseInt(daysInput.value);
-      if (typed > 0) return typed;
-      const sel = inlineForm.querySelector('.chip--day.chip--selected');
-      return sel ? parseInt(sel.dataset.days) : 0;
-    }
+    if (isCombo) {
+      // ── Combo form (pace + interest) ──
+      const selected = {};  // group → label
 
-    function validate() {
-      submitBtn.disabled = !destInput.value.trim() || !getDays();
-    }
-
-    // Day chip selection — also sync into the number input
-    inlineForm.querySelectorAll('.chip--day').forEach(btn => {
-      btn.addEventListener('click', () => {
-        inlineForm.querySelectorAll('.chip--day').forEach(b => b.classList.remove('chip--selected'));
-        btn.classList.add('chip--selected');
-        daysInput.value = btn.dataset.days;
-        validate();
+      inlineForm.querySelectorAll('.chip--pick').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const group = btn.dataset.group;
+          // Deselect siblings in same group
+          inlineForm.querySelectorAll(`.chip--pick[data-group="${group}"]`).forEach(b => b.classList.remove('chip--selected'));
+          btn.classList.add('chip--selected');
+          selected[group] = btn.textContent;
+          // Enable submit when all groups have a selection
+          const groups = new Set([...inlineForm.querySelectorAll('.chip--pick')].map(b => b.dataset.group));
+          submitBtn.disabled = Object.keys(selected).length < groups.size;
+        });
       });
-    });
 
-    // Typing in the number input clears chip selection
-    daysInput.addEventListener('input', () => {
-      inlineForm.querySelectorAll('.chip--day').forEach(b => b.classList.remove('chip--selected'));
-      validate();
-    });
+      submitBtn.addEventListener('click', () => {
+        const parts = Object.values(selected);
+        if (!parts.length) return;
+        inlineForm.remove();
+        sendMessage(parts.join(', '));
+      });
+    } else {
+      // ── Destination / days form ──
+      function getDays() {
+        const typed = parseInt(daysInput.value);
+        if (typed > 0) return typed;
+        const sel = inlineForm.querySelector('.chip--day.chip--selected');
+        return sel ? parseInt(sel.dataset.days) : 0;
+      }
 
-    destInput.addEventListener('input', validate);
+      function validate() {
+        const hasDest = isDaysOnly || (destInput && destInput.value.trim());
+        submitBtn.disabled = !hasDest || !getDays();
+      }
 
-    // Submit
-    submitBtn.addEventListener('click', () => {
-      const dest = destInput.value.trim();
-      const days = getDays();
-      if (!dest || !days) return;
-      inlineForm.remove();
-      sendMessage(`${dest}, ${days} day${days > 1 ? 's' : ''}`);
-    });
+      // Day chip selection
+      inlineForm.querySelectorAll('.chip--day').forEach(btn => {
+        btn.addEventListener('click', () => {
+          inlineForm.querySelectorAll('.chip--day').forEach(b => b.classList.remove('chip--selected'));
+          btn.classList.add('chip--selected');
+          if (daysInput) daysInput.value = btn.dataset.days;
+          validate();
+        });
+      });
 
-    // Enter in either input submits
-    [destInput, daysInput].forEach(el => {
-      el.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter' && !submitBtn.disabled) {
-          e.preventDefault();
-          submitBtn.click();
+      if (daysInput) {
+        daysInput.addEventListener('input', () => {
+          inlineForm.querySelectorAll('.chip--day').forEach(b => b.classList.remove('chip--selected'));
+          validate();
+        });
+      }
+
+      if (destInput) destInput.addEventListener('input', validate);
+
+      // Submit
+      submitBtn.addEventListener('click', () => {
+        const days = getDays();
+        if (!days) return;
+        if (isDaysOnly) {
+          inlineForm.remove();
+          sendMessage(`${days} day${days > 1 ? 's' : ''}`);
+        } else {
+          const dest = destInput ? destInput.value.trim() : '';
+          if (!dest) return;
+          inlineForm.remove();
+          sendMessage(`${dest}, ${days} day${days > 1 ? 's' : ''}`);
         }
       });
-    });
+
+      // Enter submits
+      const inputs = [daysInput, destInput].filter(Boolean);
+      inputs.forEach(el => {
+        el.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter' && !submitBtn.disabled) {
+            e.preventDefault();
+            submitBtn.click();
+          }
+        });
+      });
+    }
   }
 
   return div;
@@ -278,8 +362,8 @@ function buildAgentBubble(content, isLast) {
 /* ── Itinerary rendering ───────────────────────────────────────────────────── */
 function renderItinerary() {
   const trip = getActiveTrip();
-  const itin = trip?.itinerary;
-  if (!itin) {
+  const itineraries = trip?.itineraries || [];
+  if (!itineraries.length) {
     itineraryEl.innerHTML = `
       <div class="empty-state">
         <div class="empty-icon">🗺</div>
@@ -289,21 +373,29 @@ function renderItinerary() {
     return;
   }
 
-  const dateRange = itin.dates ? `${itin.dates.start} → ${itin.dates.end}` : '';
+  // Subtitle shows the latest itinerary info
+  const latest = itineraries[itineraries.length - 1];
+  const latestRange = latest.dates ? `${latest.dates.start} → ${latest.dates.end}` : '';
   itinerarySubtitle.textContent =
-    (itin.destination || '') + (dateRange ? '  •  ' + dateRange : '');
+    (latest.destination || '') + (latestRange ? '  •  ' + latestRange : '')
+    + (itineraries.length > 1 ? `  (${itineraries.length} trips)` : '');
 
-  const daysHtml = (itin.days || []).map(renderDay).join('\n');
+  // Render all itineraries, newest first
+  const allHtml = itineraries.slice().reverse().map(itin => {
+    const dateRange = itin.dates ? `${itin.dates.start} → ${itin.dates.end}` : '';
+    const daysHtml = (itin.days || []).map(renderDay).join('\n');
+    return `
+      <div class="itinerary">
+        <div class="itinerary-header">
+          <h2 class="destination">${esc(itin.destination || 'Unknown')}</h2>
+          <span class="date-range">${esc(dateRange)}</span>
+          <p class="weather-summary">${esc(itin.weather_summary || '')}</p>
+        </div>
+        <div class="days">${daysHtml}</div>
+      </div>`;
+  }).join('\n');
 
-  itineraryEl.innerHTML = `
-    <div class="itinerary">
-      <div class="itinerary-header">
-        <h2 class="destination">${esc(itin.destination || 'Unknown')}</h2>
-        <span class="date-range">${esc(dateRange)}</span>
-        <p class="weather-summary">${esc(itin.weather_summary || '')}</p>
-      </div>
-      <div class="days">${daysHtml}</div>
-    </div>`;
+  itineraryEl.innerHTML = allHtml;
 }
 
 function renderDay(day) {
@@ -339,6 +431,10 @@ function renderActivity(a, isLast) {
     }
   }
 
+  const imgHtml = a.image_url
+    ? `<img src="${esc(a.image_url)}" class="activity-img" loading="lazy" onerror="this.style.display='none'" />`
+    : '';
+
   return `
     <div class="activity">
       <div class="activity-main">
@@ -348,6 +444,7 @@ function renderActivity(a, isLast) {
           ${lineHtml}
         </div>
         <div class="activity-body">
+          ${imgHtml}
           <div class="activity-place">${esc(a.place || '')}</div>
           <div class="activity-address">${esc(a.address || '')}</div>
           <div class="activity-desc">${esc(a.description || '')}</div>
@@ -419,7 +516,7 @@ async function createTrip() {
     messages: [
       { role: 'agent', content: { type: "welcome", data: welcomeText } }
     ],
-    itinerary: null,
+    itineraries: [],
   };
   trips.push(trip);
   activeTripIdx = trips.length - 1;
@@ -506,11 +603,17 @@ async function sendMessage(text) {
   inputText.value = '';
   inputText.style.height = 'auto';
 
+  // Capture and clear any pending image
+  const imageId = pendingImageId;
+  const imageUrl = pendingImageUrl;
+  clearPendingImage();
+
   // Push user message to data model and render
   const trip = getActiveTrip();
   if (!trip) return;
-  trip.messages.push({ role: 'user', content: msg });
-  messagesEl.appendChild(buildUserBubble(msg));
+  const userContent = imageUrl ? { text: msg, image_url: imageUrl } : msg;
+  trip.messages.push({ role: 'user', content: userContent });
+  messagesEl.appendChild(buildUserBubble(userContent));
   document.querySelectorAll('.inline-chips').forEach(el => el.remove());  // clear chips
   scrollToBottom();
   setProcessing(true);
@@ -530,47 +633,75 @@ async function sendMessage(text) {
     const res = await fetch('/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: msg, session_id: getSessionId() }),
+      body: JSON.stringify({ message: msg, session_id: getSessionId(), image_id: imageId || '' }),
       signal: chatAbortController.signal,
     });
     if (gen !== _sendGeneration) return;
     if (!res.ok) throw new Error(`Server error ${res.status}`);
-    const data = await res.json();
-    if (gen !== _sendGeneration) return;
 
-    removeTyping(typingId);
+    // Read SSE stream
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
 
-    // data.response = {type: "text"|"itinerary", data: ...}
-    const resp = data.response;
-    trip.messages.push({ role: 'agent', content: resp });
-    messagesEl.appendChild(buildAgentBubble(resp, true));  // last message → show chips
-    scrollToBottom();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (gen !== _sendGeneration) return;
 
-    if (resp.type === 'itinerary') {
-      trip.itinerary = resp.data;
-      trip.name = resp.data.destination || trip.name;
-      renderItinerary();
-      renderTripList();
-      showItineraryBadge();
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop();  // keep incomplete line
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        let data;
+        try { data = JSON.parse(line.slice(6)); } catch (_) { continue; }
+
+        if (data.event === 'progress') {
+          updateTypingStatus(typingId, data.text);
+
+        } else if (data.event === 'done') {
+          removeTyping(typingId);
+          const resp = data.response;
+          trip.messages.push({ role: 'agent', content: resp });
+          messagesEl.appendChild(buildAgentBubble(resp, true));
+          scrollToBottom();
+
+          if (resp.type === 'itinerary') {
+            trip.itineraries.push(resp.data);
+            trip.name = resp.data.destination || trip.name;
+            renderItinerary();
+            renderTripList();
+            showItineraryBadge();
+          }
+
+          if (data.audio_url) playTTS(data.audio_url);
+          persistTrips();
+          loadMemoriesUI();
+
+        } else if (data.event === 'error') {
+          removeTyping(typingId);
+          const errText = `Something went wrong: ${esc(data.text)}`;
+          trip.messages.push({ role: 'agent', content: errText });
+          messagesEl.appendChild(buildAgentBubble(errText));
+          scrollToBottom();
+        }
+      }
     }
-
-    if (data.audio_url) playTTS(data.audio_url);
-    persistTrips();
-    loadPrefsUI();  // sync sidebar panel in case agent saved preferences
 
   } catch (err) {
     if (gen !== _sendGeneration) return;
     removeTyping(typingId);
     if (err.name === 'AbortError') return;
     const detail = navigator.onLine ? esc(err.message) : 'You appear to be offline.';
-    // Push error as agent message
     const errText = `Something went wrong: ${detail}`;
     trip.messages.push({ role: 'agent', content: errText });
     messagesEl.appendChild(buildAgentBubble(errText));
     scrollToBottom();
   } finally {
     chatAbortController = null;
-    if (gen === _sendGeneration) setProcessing(false);
+    setProcessing(false);
   }
 }
 
@@ -701,10 +832,24 @@ function appendTyping() {
   div.id = id;
   div.innerHTML = `
     <div class="message__avatar">✈</div>
-    <div class="message__bubble"><div class="typing-dots"><span></span><span></span><span></span></div></div>`;
+    <div class="message__bubble">
+      <div class="typing-dots"><span></span><span></span><span></span></div>
+      <div class="typing-status"></div>
+    </div>`;
   messagesEl.appendChild(div);
   scrollToBottom();
   return id;
+}
+
+function updateTypingStatus(id, text) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  const statusEl = el.querySelector('.typing-status');
+  if (statusEl) {
+    statusEl.textContent = text;
+    statusEl.style.display = text ? 'block' : 'none';
+  }
+  scrollToBottom();
 }
 
 function removeTyping(id) { document.getElementById(id)?.remove(); }
@@ -766,66 +911,125 @@ btnTheme.addEventListener('click', () => {
 applyTheme(localStorage.getItem('travelai_theme') || 'dark');
 
 /* ══════════════════════════════════════════════════════════════════════════════
-   PREFERENCES PANEL
+   MEMORY PANEL
    ══════════════════════════════════════════════════════════════════════════════ */
 
-const prefsToggle = document.getElementById('prefs-toggle');
-const prefsPanel  = document.getElementById('prefs-panel');
-const prefsArrow  = document.getElementById('prefs-arrow');
-const prefPace    = document.getElementById('pref-pace');
-const prefLunch   = document.getElementById('pref-lunch');
-const prefDinner  = document.getElementById('pref-dinner');
-const prefInterestChecks = document.querySelectorAll('#pref-interests input[type="checkbox"]');
-const btnSavePrefs = document.getElementById('btn-save-prefs');
+const memoryToggle  = document.getElementById('memory-toggle');
+const memoryPanel   = document.getElementById('memory-panel');
+const memoryArrow   = document.getElementById('memory-arrow');
+const memoryListEl  = document.getElementById('memory-list');
+const memoryCount   = document.getElementById('memory-count');
+const memoryAddInput = document.getElementById('memory-add-input');
+const memoryAddBtn  = document.getElementById('memory-add-btn');
 
-prefsToggle.addEventListener('click', () => {
-  const isOpen = !prefsPanel.hidden;
-  prefsPanel.hidden = isOpen;
-  prefsArrow.classList.toggle('open', !isOpen);
+memoryToggle.addEventListener('click', () => {
+  const isOpen = !memoryPanel.hidden;
+  memoryPanel.hidden = isOpen;
+  memoryArrow.classList.toggle('open', !isOpen);
+  if (!isOpen) loadMemoriesUI();
 });
 
-async function loadPrefsUI() {
+async function loadMemoriesUI() {
   try {
-    const res = await fetch('/preferences');
+    const res = await fetch('/memories');
     if (!res.ok) return;
-    const prefs = await res.json();
-    if (prefs.pace) prefPace.value = prefs.pace;
-    if (prefs.lunch_time) prefLunch.value = prefs.lunch_time;
-    if (prefs.dinner_time) prefDinner.value = prefs.dinner_time;
-    if (Array.isArray(prefs.interests)) {
-      prefInterestChecks.forEach(cb => {
-        cb.checked = prefs.interests.includes(cb.value);
-      });
-    }
+    const memories = await res.json();
+    renderMemories(memories);
   } catch (_) {}
 }
 
-btnSavePrefs.addEventListener('click', async () => {
-  const interests = [];
-  prefInterestChecks.forEach(cb => { if (cb.checked) interests.push(cb.value); });
+function renderMemories(memories) {
+  if (!memories.length) {
+    memoryListEl.innerHTML = '<div class="memory-empty">No memories yet. I\'ll learn your preferences as we chat.</div>';
+    memoryCount.hidden = true;
+    return;
+  }
+  memoryCount.textContent = memories.length;
+  memoryCount.hidden = false;
+  memoryListEl.innerHTML = memories.map(m => `
+    <div class="memory-item" data-id="${esc(m.id)}">
+      <span class="memory-text">${esc(m.text)}</span>
+      <button class="memory-delete" data-id="${esc(m.id)}" title="Forget">&times;</button>
+    </div>
+  `).join('');
+  memoryListEl.querySelectorAll('.memory-delete').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const id = btn.dataset.id;
+      try {
+        await fetch(`/memories/${id}`, { method: 'DELETE' });
+        loadMemoriesUI();
+      } catch (_) {}
+    });
+  });
+}
 
-  const body = {
-    pace: prefPace.value || undefined,
-    interests: interests.length ? interests : undefined,
-    lunch_time: prefLunch.value || undefined,
-    dinner_time: prefDinner.value || undefined,
-  };
-
+async function addMemoryManual() {
+  const text = memoryAddInput.value.trim();
+  if (!text) return;
+  memoryAddInput.value = '';
   try {
-    await fetch('/preferences', {
+    await fetch('/memories', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
+      body: JSON.stringify({ text }),
     });
-    btnSavePrefs.textContent = 'Saved!';
-    btnSavePrefs.classList.add('saved');
-    setTimeout(() => {
-      btnSavePrefs.textContent = 'Save';
-      btnSavePrefs.classList.remove('saved');
-    }, 1500);
-  } catch (e) {
-    btnSavePrefs.textContent = 'Error';
-    setTimeout(() => { btnSavePrefs.textContent = 'Save'; }, 1500);
+    loadMemoriesUI();
+  } catch (_) {}
+}
+
+memoryAddBtn.addEventListener('click', addMemoryManual);
+memoryAddInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); addMemoryManual(); }
+});
+
+/* ══════════════════════════════════════════════════════════════════════════════
+   IMAGE UPLOAD & PASTE
+   ══════════════════════════════════════════════════════════════════════════════ */
+
+function clearPendingImage() {
+  pendingImageId = null;
+  pendingImageUrl = null;
+  imagePreviewBar.hidden = true;
+  imagePreviewThumb.src = '';
+  imageInput.value = '';
+}
+
+async function uploadImageFile(file) {
+  if (!file || !file.type.startsWith('image/')) return;
+  const formData = new FormData();
+  formData.append('image', file, file.name || 'image.jpg');
+
+  try {
+    const res = await fetch('/upload-image', { method: 'POST', body: formData });
+    if (!res.ok) throw new Error(`Upload failed ${res.status}`);
+    const data = await res.json();
+    pendingImageId = data.image_id;
+    pendingImageUrl = data.url;
+    imagePreviewThumb.src = data.url;
+    imagePreviewBar.hidden = false;
+    inputText.focus();
+  } catch (err) {
+    console.error('Image upload failed:', err);
+  }
+}
+
+btnUpload.addEventListener('click', () => imageInput.click());
+imageInput.addEventListener('change', () => {
+  if (imageInput.files.length) uploadImageFile(imageInput.files[0]);
+});
+imagePreviewRemove.addEventListener('click', clearPendingImage);
+
+// Ctrl+V / Cmd+V paste image
+document.addEventListener('paste', (e) => {
+  const items = e.clipboardData?.items;
+  if (!items) return;
+  for (const item of items) {
+    if (item.type.startsWith('image/')) {
+      e.preventDefault();
+      uploadImageFile(item.getAsFile());
+      return;
+    }
   }
 });
 
@@ -834,7 +1038,7 @@ btnSavePrefs.addEventListener('click', async () => {
    ══════════════════════════════════════════════════════════════════════════════ */
 
 (async function init() {
-  loadPrefsUI();
+  loadMemoriesUI();
 
   // Check if the server has restarted (fresh user) by comparing a boot token
   let serverBoot = '';
@@ -867,6 +1071,13 @@ btnSavePrefs.addEventListener('click', async () => {
 })();
 
 function migrateTrip(trip) {
+  // Migrate old itinerary (single) → itineraries (array)
+  if (trip.itinerary && !trip.itineraries) {
+    trip.itineraries = [trip.itinerary];
+    delete trip.itinerary;
+  }
+  if (!trip.itineraries) trip.itineraries = [];
+
   if (Array.isArray(trip.messages)) return trip;
   const messages = [
     { role: 'agent', content: { type: 'welcome', data: "Hello! I'm your AI travel assistant. Tell me where you'd like to go, and I'll plan the perfect trip for you.\n\n**Tips**\n🌗 Toggle light/dark mode — button next to the logo (top-left)\n🔇 A stop button appears at the top-right when I'm speaking" } }
@@ -875,6 +1086,6 @@ function migrateTrip(trip) {
     id: trip.id || uuid(),
     name: trip.name || 'New Trip',
     messages,
-    itinerary: null,
+    itineraries: trip.itineraries || [],
   };
 }

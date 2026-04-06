@@ -58,6 +58,7 @@ def _normalize_activity(activity: dict) -> dict:
         "address": activity.get("address") or "",
         "description": activity.get("description") or "",
         "duration_minutes": activity.get("duration_minutes") or 0,
+        "image_url": activity.get("image_url") or "",
         "transport_to_next": transport_out,
     }
 

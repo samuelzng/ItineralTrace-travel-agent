@@ -20,9 +20,14 @@ async def synthesize(
         os.close(fd)
 
     logger.info("Synthesizing TTS → %s (voice: %s)", output_path, voice)
-    communicate = edge_tts.Communicate(text, voice)
-    await communicate.save(output_path)
-    logger.info("TTS saved: %s", output_path)
+    try:
+        communicate = edge_tts.Communicate(text, voice)
+        await communicate.save(output_path)
+        logger.info("TTS saved: %s", output_path)
+    except Exception as e:
+        logger.error("edge-tts failed: %s", e)
+        # Write empty file so caller doesn't break on missing file
+        open(output_path, "wb").close()
     return output_path
 
 
