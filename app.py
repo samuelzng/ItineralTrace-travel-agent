@@ -17,9 +17,12 @@ from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+import re
+
 import agent as travel_agent
 import renderer
 from tts import synthesize
+from user_memory import load_preferences, save_preferences, load_memories, save_memory, delete_memory, update_memory
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -62,8 +65,10 @@ app = FastAPI(title="ItineraTrace", lifespan=lifespan)
 STATIC_DIR = BASE_DIR / "static"
 AUDIO_DIR = STATIC_DIR / "audio"
 UPLOAD_DIR = STATIC_DIR / "uploads"
+IMG_CACHE_DIR = STATIC_DIR / "imgcache"
 AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+IMG_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
@@ -72,6 +77,9 @@ _AUDIO_MAX_AGE = 300
 
 # In-memory session store: session_id → conversation history
 _sessions: dict[str, list] = {}
+# Session last-access time for TTL cleanup
+_session_atime: dict[str, float] = {}
+_SESSION_TTL = 7200  # 2 hours
 # Per-session cancel events: session_id → threading.Event
 _cancel_events: dict[str, threading.Event] = {}
 
@@ -123,6 +131,7 @@ async def chat(req: ChatRequest):
     """Process a text message — streams progress events via SSE, then final response."""
     session_id = req.session_id or str(uuid.uuid4())
     history = _sessions.setdefault(session_id, [])
+    _session_atime[session_id] = time.time()
 
     logger.info("[%s] User: %s", session_id, req.message)
 
@@ -191,21 +200,22 @@ async def chat(req: ChatRequest):
         itinerary = result.get("itinerary")
         structured = renderer.render(result)
 
-        # TTS (non-blocking on failure)
-        tts_text = _tts_text(text, itinerary)
+        logger.info("[%s] Response ready (type=%s)", session_id, structured["type"])
+        _cleanup_old_audio()
+        _cleanup_stale_sessions()
+
+        # Synthesize TTS first, then send everything together in one event
         audio_url = ""
+        tts_text = _tts_text(text, itinerary)
         if tts_text.strip():
-            yield _sse("progress", {"text": "Generating audio..."})
             try:
+                # yield _sse("progress", {"text": "Generating audio..."})
                 audio_filename = f"{uuid.uuid4()}.mp3"
                 audio_path = str(AUDIO_DIR / audio_filename)
                 await synthesize(tts_text, audio_path)
                 audio_url = f"/static/audio/{audio_filename}"
             except Exception as e:
                 logger.warning("TTS failed (non-fatal): %s", e)
-
-        logger.info("[%s] Response ready (type=%s)", session_id, structured["type"])
-        _cleanup_old_audio()
 
         yield _sse("done", {
             "response": structured,
@@ -252,33 +262,58 @@ async def upload_image(image: UploadFile = File(...)):
     return {"image_id": image_id, "url": f"/static/uploads/{image_id}"}
 
 
+@app.get("/imgproxy")
+async def image_proxy(url: str):
+    """Cache and serve external images locally to prevent broken links."""
+    import hashlib
+    import httpx
+    if not url:
+        raise HTTPException(status_code=400, detail="Missing url param")
+    # Deterministic filename from URL
+    ext = Path(url.split("?")[0]).suffix.lower()
+    if ext not in (".jpg", ".jpeg", ".png", ".webp", ".gif"):
+        ext = ".jpg"
+    filename = hashlib.md5(url.encode()).hexdigest() + ext
+    cached = IMG_CACHE_DIR / filename
+    if cached.exists():
+        return FileResponse(cached, media_type=f"image/{ext.lstrip('.')}")
+    # Download and cache
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=8) as client:
+            resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+            if resp.status_code != 200:
+                raise HTTPException(status_code=502, detail="Upstream image failed")
+            ct = resp.headers.get("content-type", "")
+            if "image" not in ct and len(resp.content) < 1000:
+                raise HTTPException(status_code=502, detail="Not an image")
+            cached.write_bytes(resp.content)
+            return FileResponse(cached, media_type=ct or f"image/{ext.lstrip('.')}")
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Image fetch failed: {e}")
+
+
 @app.get("/preferences")
 async def get_preferences():
     """Return saved user preferences (if any)."""
-    from user_memory import load_preferences
     return load_preferences() or {}
 
 
 @app.post("/preferences")
 async def set_preferences(req: Request):
     """Save user preferences from the sidebar editor."""
-    from user_memory import save_preferences
     data = await req.json()
-    result = save_preferences(**data)
-    return result
+    return save_preferences(**data)
 
 
 @app.get("/memories")
 async def get_memories():
     """Return all saved user memories."""
-    from user_memory import load_memories
     return load_memories()
 
 
 @app.post("/memories")
 async def add_memory(req: Request):
     """Manually add a memory."""
-    from user_memory import save_memory
     data = await req.json()
     text = data.get("text", "").strip()
     if not text:
@@ -286,10 +321,19 @@ async def add_memory(req: Request):
     return save_memory(text)
 
 
+@app.put("/memories/{memory_id}")
+async def edit_memory(memory_id: str, req: Request):
+    """Update a memory's text."""
+    data = await req.json()
+    text = data.get("text", "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Memory text is required")
+    return update_memory(memory_id, text)
+
+
 @app.delete("/memories/{memory_id}")
 async def remove_memory(memory_id: str):
     """Delete a memory by ID."""
-    from user_memory import delete_memory
     return delete_memory(memory_id)
 
 
@@ -301,6 +345,7 @@ async def clear_session(session_id: str):
     if cancel_event:
         cancel_event.set()
     _sessions.pop(session_id, None)
+    _session_atime.pop(session_id, None)
     _cleanup_old_audio()  # Clean up expired audio only
     return {"cleared": session_id}
 
@@ -318,7 +363,19 @@ def _cleanup_old_audio(max_age: int = _AUDIO_MAX_AGE):
             pass
 
 
-def _cleanup_old_uploads(max_age: int = 300):
+def _cleanup_stale_sessions():
+    """Remove sessions that haven't been accessed within the TTL."""
+    now = time.time()
+    stale = [sid for sid, atime in _session_atime.items() if now - atime > _SESSION_TTL]
+    for sid in stale:
+        _sessions.pop(sid, None)
+        _session_atime.pop(sid, None)
+        _cancel_events.pop(sid, None)
+    if stale:
+        logger.info("Cleaned up %d stale sessions", len(stale))
+
+
+def _cleanup_old_uploads(max_age: int = 1800):
     """Remove uploaded images older than max_age seconds."""
     now = time.time()
     for f in UPLOAD_DIR.iterdir():
@@ -331,7 +388,6 @@ def _cleanup_old_uploads(max_age: int = 300):
 
 def _strip_markdown(text: str) -> str:
     """Remove common markdown so edge-tts reads cleanly."""
-    import re
     text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)   # code blocks
     text = re.sub(r'`[^`]*`', '', text)                       # inline code
     text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)             # bold
@@ -347,7 +403,11 @@ def _strip_markdown(text: str) -> str:
 
 
 def _tts_text(raw_text: str, itinerary: dict | None) -> str:
-    """Produce a clean, speakable summary for TTS."""
+    """Produce a clean, speakable summary for TTS.
+
+    For itineraries, only speak a brief overview (destination + weather + place
+    highlights per day) to keep audio short and snappy.
+    """
     if not itinerary:
         return _strip_markdown(raw_text)
 
@@ -359,32 +419,14 @@ def _tts_text(raw_text: str, itinerary: dict | None) -> str:
     parts = [f"Here is your {n_days}-day itinerary for {dest}. {summary}"]
 
     for i, day in enumerate(days, 1):
-        date = day.get("date", f"Day {i}")
         weather = day.get("weather", {})
         condition = weather.get("condition", "")
-        temp_high = weather.get("temp_high", "")
-        temp_low = weather.get("temp_low", "")
         activities = day.get("activities", [])
+        place_names = [a.get("place", "") for a in activities if a.get("place")]
 
-        weather_str = f"{condition}, high {temp_high} degrees, low {temp_low} degrees." if condition else ""
-        parts.append(f"Day {i}, {date}. {weather_str}")
-
-        for j, act in enumerate(activities, 1):
-            place = act.get("place", "")
-            time = act.get("time", "")
-            description = act.get("description", "")
-            duration = act.get("duration_minutes", "")
-            transport = act.get("transport_to_next")
-
-            parts.append(
-                f"Activity {j}: At {time}, visit {place}. {description} "
-                f"Spend about {duration} minutes here."
-            )
-            if transport:
-                mode = transport.get("mode", "")
-                dur = transport.get("duration", "")
-                dist = transport.get("distance", "")
-                parts.append(f"Then travel by {mode}, {dur}, {dist}.")
+        weather_str = f" {condition}." if condition else ""
+        highlights = ", ".join(place_names[:4])
+        parts.append(f"Day {i}:{weather_str} {highlights}.")
 
     return " ".join(parts)
 
@@ -397,7 +439,7 @@ if __name__ == "__main__":
     is_dev = "--dev" in sys.argv
     uvicorn.run(
         "app:app",
-        host="0.0.0.0",
+        host="127.0.0.1",
         port=8000,
         reload=is_dev,
         reload_includes=["*.py"] if is_dev else None,

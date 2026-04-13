@@ -1,6 +1,7 @@
 """Routing tool — OSRM for walk/bike/drive, estimated transit via OSRM fallback."""
 
 import logging
+import re
 import threading
 import time
 import requests
@@ -27,7 +28,6 @@ OSRM_PROFILES = {
 def _geocode(location: str, city_hint: str = "") -> tuple[float, float]:
     """Resolve address/place name to lat/lng via Nominatim (cached, rate-limited)."""
     global _last_nominatim_call
-    import re
 
     cache_key = f"{location}|{city_hint}".lower()
     if cache_key in _geocode_cache:

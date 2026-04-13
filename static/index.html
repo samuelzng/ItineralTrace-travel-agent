@@ -7,7 +7,8 @@
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><path d='M2 14L28 2 18 30 14 18z' fill='%234285F4'/><path d='M28 2L14 18l4 12z' fill='%232563EB'/></svg>" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Playfair+Display:wght@600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/style.css?v=21" />
+  <link rel="stylesheet" href="/static/style.css?v=22" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 </head>
 <body>
 
@@ -137,13 +138,21 @@
   <!-- Audio player (hidden) -->
   <audio id="tts-audio" hidden></audio>
 
-  <!-- Global stop-TTS button (floating, visible on all panels) -->
-  <button class="btn-stop-tts" id="btn-stop-tts" title="Stop speaking" hidden>
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-      <rect x="6" y="6" width="12" height="12" rx="2" />
-    </svg>
-    <span>Stop</span>
-  </button>
+  <!-- Global TTS controls (floating, visible on all panels) -->
+  <div class="tts-controls" id="tts-controls" hidden>
+    <button class="btn-tts-ctrl btn-tts-stop" id="btn-stop-tts" title="Pause speaking">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+        <rect x="6" y="6" width="12" height="12" rx="2" />
+      </svg>
+      <span>Stop</span>
+    </button>
+    <button class="btn-tts-ctrl btn-tts-play" id="btn-play-tts" title="Resume speaking" hidden>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+        <polygon points="6,4 20,12 6,20" fill="currentColor" stroke="none" />
+      </svg>
+      <span>Play</span>
+    </button>
+  </div>
 
   <!-- Mobile bottom nav -->
   <nav class="mobile-nav" id="mobile-nav">
@@ -170,6 +179,7 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=21"></script>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="/static/app.js?v=22"></script>
 </body>
 </html>

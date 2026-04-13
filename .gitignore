@@ -13,4 +13,5 @@ user_memories.json
 PLAN.md
 .claude/
 static/uploads/
+static/imgcache/
 .claude

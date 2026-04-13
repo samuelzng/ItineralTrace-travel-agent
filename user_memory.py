@@ -40,6 +40,20 @@ def load_preferences() -> dict:
             return {}
 
 
+def _upsert_memory(prefix: str, new_text: str) -> None:
+    """Update an existing memory that starts with prefix, or create it."""
+    memories = load_memories()
+    for m in memories:
+        if m["text"].startswith(prefix):
+            if m["text"] == new_text:
+                return  # already up-to-date
+            m["text"] = new_text
+            _persist_memories(memories)
+            return
+    # No existing match — create new
+    save_memory(new_text)
+
+
 def save_preferences(**prefs) -> dict:
     """Merge and save user preferences. Returns the saved prefs."""
     with _lock:
@@ -57,13 +71,14 @@ def save_preferences(**prefs) -> dict:
 
         # Sync pace and interests into freeform memories so they
         # persist visibly and carry across new trips.
+        # Use _upsert_memory to avoid duplicates when prefs change.
         if existing.get("pace"):
-            save_memory(f"Preferred travel pace: {existing['pace']}")
+            _upsert_memory("Preferred travel pace:", f"Preferred travel pace: {existing['pace']}")
         if existing.get("interests"):
             interests = existing["interests"]
             if isinstance(interests, list):
                 interests = ", ".join(interests)
-            save_memory(f"Interests: {interests}")
+            _upsert_memory("Interests:", f"Interests: {interests}")
 
         return {"status": "saved", "preferences": existing}
 
@@ -142,6 +157,19 @@ def delete_memory(memory_id: str) -> dict:
             return {"status": "not_found"}
         _persist_memories(memories)
         return {"status": "deleted"}
+
+
+def update_memory(memory_id: str, text: str) -> dict:
+    """Update an existing memory's text by ID."""
+    with _lock:
+        memories = load_memories()
+        for m in memories:
+            if m["id"] == memory_id:
+                m["text"] = text.strip()
+                _persist_memories(memories)
+                logger.info("Updated memory %s: %s", memory_id, text)
+                return {"status": "updated", "memory": m}
+        return {"status": "not_found"}
 
 
 def format_memories_for_prompt() -> str:

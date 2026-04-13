@@ -1,6 +1,7 @@
 """Renderer — normalize agent output into clean structured JSON."""
 
 from __future__ import annotations
+from urllib.parse import quote
 
 
 def render(agent_result: dict) -> dict:
@@ -52,13 +53,20 @@ def _normalize_activity(activity: dict) -> dict:
             "distance": str(transport.get("distance") or ""),
         }
 
+    # Route external images through /imgproxy to cache locally
+    raw_img = activity.get("image_url") or ""
+    if raw_img and raw_img.startswith("http"):
+        img_url = f"/imgproxy?url={quote(raw_img, safe='')}"
+    else:
+        img_url = raw_img
+
     return {
         "time": activity.get("time") or "",
         "place": activity.get("place") or "",
         "address": activity.get("address") or "",
         "description": activity.get("description") or "",
         "duration_minutes": activity.get("duration_minutes") or 0,
-        "image_url": activity.get("image_url") or "",
+        "image_url": img_url,
         "transport_to_next": transport_out,
     }
 

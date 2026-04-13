@@ -12,12 +12,21 @@ const TRANSPORT_ICONS = {
 let trips = [];
 let activeTripIdx = -1;
 let isProcessing = false;
-let chatAbortController = null;
+// Per-trip abort controllers stored on trip._abortCtrl
 let mediaRecorder = null;
 let audioChunks = [];
 let _sendGeneration = 0;
 let pendingImageId = null;    // image_id from /upload-image
 let pendingImageUrl = null;   // local preview URL
+
+/* ── Map state (declared early so switchPanel/enterSplitView can reference) ── */
+let _map = null;
+let _mapTileLayer = null;
+let _mapMarkers = [];
+let _mapLines = [];
+let _mapLegend = null;
+let _mapGeneration = 0;
+const _geocodeCache = {};
 
 /* ── DOM refs ──────────────────────────────────────────────────────────────── */
 const messagesEl        = document.getElementById('messages');
@@ -412,6 +421,7 @@ function renderItinerary() {
       </div>`;
     itinerarySubtitle.textContent = DEFAULT_SUBTITLE;
     if (exportActions) exportActions.hidden = true;
+    _destroyMap();
     return;
   }
 
@@ -437,8 +447,14 @@ function renderItinerary() {
       </div>`;
   }).join('\n');
 
-  itineraryEl.innerHTML = allHtml;
+  // Prepend map container, then itinerary content
+  itineraryEl.innerHTML = `
+    <div class="itinerary-map-wrap" id="itinerary-map-wrap">
+      <div id="itinerary-map"></div>
+      <div class="map-loading" id="map-loading">Placing pins on map…</div>
+    </div>` + allHtml;
   if (exportActions) exportActions.hidden = false;
+  updateItineraryMap(latest);
 }
 
 function renderDay(day) {
@@ -524,9 +540,11 @@ function persistTrips() {
   }
 }
 
-function cancelInFlight() {
-  _sendGeneration++;
-  if (chatAbortController) { chatAbortController.abort(); chatAbortController = null; }
+function cancelInFlight(trip) {
+  // Cancel the specific trip's in-flight request (if any)
+  const t = trip || getActiveTrip();
+  if (t && t._abortCtrl) { t._abortCtrl.abort(); delete t._abortCtrl; }
+  if (t) { t.isGenerating = false; t.lastProgress = ''; delete t._typingId; }
   stopTTS();
   document.querySelectorAll('.message--typing').forEach(el => el.remove());
   setProcessing(false);
@@ -534,7 +552,11 @@ function cancelInFlight() {
 
 /* ── Trip CRUD ─────────────────────────────────────────────────────────────── */
 async function createTrip() {
-  cancelInFlight();
+  // Don't cancel in-flight requests — let background trips finish.
+  // Only stop audio and clean up typing UI for the current view.
+  stopTTS();
+  document.querySelectorAll('.message--typing').forEach(el => el.remove());
+  setProcessing(false);
 
   const id = uuid();
 
@@ -560,6 +582,10 @@ async function createTrip() {
       { role: 'agent', content: { type: "welcome", data: welcomeText } }
     ],
     itineraries: [],
+    isGenerating: false,
+    lastProgress: '',
+    imageId: null,
+    imagePreview: null,
   };
   trips.push(trip);
   activeTripIdx = trips.length - 1;
@@ -574,12 +600,35 @@ async function createTrip() {
 
 function switchTrip(idx) {
   if (idx === activeTripIdx) return;
-  cancelInFlight();
+  // Do NOT cancel in-flight requests — let the generation continue in the background.
+  stopTTS();
   activeTripIdx = idx;
   persistTrips();
   renderAllMessages();
   renderItinerary();
   renderTripList();
+
+  // Restore image preview for the target trip
+  const target = getActiveTrip();
+  if (target?.imagePreview) {
+    pendingImageId = target.imageId;
+    pendingImageUrl = target.imagePreview;
+    imagePreviewThumb.src = target.imagePreview;
+    imagePreviewBar.hidden = false;
+  } else {
+    clearPendingImage();
+  }
+
+  // Restore UI state for the target trip
+  if (target && target.isGenerating) {
+    setProcessing(true);
+    const typingId = appendTyping();
+    // Store the typing element ID so the SSE handler can find it
+    target._typingId = typingId;
+    if (target.lastProgress) updateTypingStatus(typingId, target.lastProgress);
+  } else {
+    setProcessing(false);
+  }
 }
 
 function deleteActiveTrip() {
@@ -641,14 +690,18 @@ function renderTripList() {
 
 async function sendMessage(text) {
   const msg = (text || inputText.value).trim();
-  if (!msg || isProcessing) return;
+  if (!msg) return;
+  const currentTrip = getActiveTrip();
+  if (!currentTrip || currentTrip.isGenerating) return;
 
   inputText.value = '';
   inputText.style.height = 'auto';
 
-  // Capture and clear any pending image
-  const imageId = pendingImageId;
-  const imageUrl = pendingImageUrl;
+  // Capture and clear any pending image (per-trip)
+  const imageId = currentTrip.imageId || pendingImageId || '';
+  const imageUrl = currentTrip.imagePreview || pendingImageUrl;
+  currentTrip.imageId = null;
+  currentTrip.imagePreview = null;
   clearPendingImage();
 
   // Push user message to data model and render
@@ -672,18 +725,37 @@ async function sendMessage(text) {
     renderTripList();
   }
 
-  const gen = _sendGeneration;
-  chatAbortController = new AbortController();
-  const typingId = appendTyping();
+  const gen = ++_sendGeneration;
+  _ttsGeneration = gen;  // only play audio from this request
+  // Use trip.id for stable identity — survives persistTrips() / array rebuilds
+  const tripId = trip.id;
+  const findTrip = () => trips.find(t => t.id === tripId);
+  const isTripActive = () => {
+    const at = getActiveTrip();
+    return at && at.id === tripId;
+  };
+  // Per-trip abort controller so switching doesn't kill other trips' requests
+  const abortCtrl = new AbortController();
+  trip._abortCtrl = abortCtrl;
+  // Store typing element ID on trip so switchTrip can recreate it
+  const initialTypingId = appendTyping();
+  trip._typingId = initialTypingId;
+  const getTypingId = () => {
+    const t = findTrip();
+    return t ? t._typingId : initialTypingId;
+  };
+
+  trip.isGenerating = true;
+  trip.lastProgress = '';
 
   try {
     const res = await fetch('/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: msg, session_id: getSessionId(), image_id: imageId || '' }),
-      signal: chatAbortController.signal,
+      body: JSON.stringify({ message: msg, session_id: trip.id, image_id: imageId || '' }),
+      signal: abortCtrl.signal,
     });
-    if (gen !== _sendGeneration) return;
+    if (!findTrip()) return;  // trip was deleted
     if (!res.ok) throw new Error(`Server error ${res.status}`);
 
     // Read SSE stream
@@ -694,7 +766,7 @@ async function sendMessage(text) {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      if (gen !== _sendGeneration) return;
+      if (!findTrip()) return;  // trip was deleted
 
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split('\n');
@@ -706,49 +778,71 @@ async function sendMessage(text) {
         try { data = JSON.parse(line.slice(6)); } catch (_) { continue; }
 
         if (data.event === 'progress') {
-          updateTypingStatus(typingId, data.text);
+          // Always persist progress to the trip data model
+          const t = findTrip();
+          if (t) t.lastProgress = data.text;
+          if (isTripActive()) updateTypingStatus(getTypingId(), data.text);
 
         } else if (data.event === 'done') {
-          removeTyping(typingId);
+          const t = findTrip();
+          const typingIdToRemove = getTypingId();
+          if (t) { t.isGenerating = false; t.lastProgress = ''; delete t._typingId; delete t._abortCtrl; }
+          if (isTripActive()) removeTyping(typingIdToRemove);
           const resp = data.response;
-          trip.messages.push({ role: 'agent', content: resp });
-          messagesEl.appendChild(buildAgentBubble(resp, true));
-          scrollToBottom();
-
-          if (resp.type === 'itinerary' && resp.data) {
-            trip.itineraries.push(resp.data);
-            trip.name = resp.data.destination || trip.name;
-            renderItinerary();
-            renderTripList();
-            showItineraryBadge();
+          if (t) t.messages.push({ role: 'agent', content: resp });
+          if (isTripActive()) {
+            messagesEl.appendChild(buildAgentBubble(resp, true));
+            scrollToBottom();
           }
 
-          if (data.audio_url) playTTS(data.audio_url);
+          if (resp.type === 'itinerary' && resp.data) {
+            if (t) {
+              t.itineraries.push(resp.data);
+              t.name = resp.data.destination || t.name;
+            }
+            if (isTripActive()) {
+              renderItinerary();
+              showItineraryBadge();
+            }
+            renderTripList();
+          }
+
+          if (isTripActive() && data.audio_url) playTTS(data.audio_url, gen);
           persistTrips();
           loadMemoriesUI();
 
         } else if (data.event === 'error') {
-          removeTyping(typingId);
+          const t = findTrip();
+          const typingIdToRemove = getTypingId();
+          if (t) { t.isGenerating = false; t.lastProgress = ''; delete t._typingId; delete t._abortCtrl; }
+          if (isTripActive()) removeTyping(typingIdToRemove);
           const errText = `Something went wrong: ${esc(data.text)}`;
-          trip.messages.push({ role: 'agent', content: errText });
-          messagesEl.appendChild(buildAgentBubble(errText));
-          scrollToBottom();
+          if (t) t.messages.push({ role: 'agent', content: errText });
+          if (isTripActive()) {
+            messagesEl.appendChild(buildAgentBubble(errText));
+            scrollToBottom();
+          }
         }
       }
     }
 
   } catch (err) {
-    if (gen !== _sendGeneration) return;
-    removeTyping(typingId);
+    const t = findTrip();
+    const typingIdToRemove = getTypingId();
+    if (t) { t.isGenerating = false; t.lastProgress = ''; delete t._typingId; delete t._abortCtrl; }
+    if (isTripActive()) removeTyping(typingIdToRemove);
     if (err.name === 'AbortError') return;
+    if (!t) return;  // trip was deleted
     const detail = navigator.onLine ? esc(err.message) : 'You appear to be offline.';
     const errText = `Something went wrong: ${detail}`;
-    trip.messages.push({ role: 'agent', content: errText });
-    messagesEl.appendChild(buildAgentBubble(errText));
-    scrollToBottom();
+    if (t) t.messages.push({ role: 'agent', content: errText });
+    if (isTripActive()) {
+      messagesEl.appendChild(buildAgentBubble(errText));
+      scrollToBottom();
+    }
+    persistTrips();
   } finally {
-    chatAbortController = null;
-    setProcessing(false);
+    if (isTripActive()) setProcessing(false);
   }
 }
 
@@ -777,6 +871,7 @@ function switchPanel(target) {
   if (target === 'itinerary') {
     itineraryBadge.hidden = true;
     if (mobileBadge) mobileBadge.hidden = true;
+    requestAnimationFrame(() => { if (_map) _map.invalidateSize(); });
   }
 }
 
@@ -802,6 +897,7 @@ function enterSplitView() {
   if (mobileBadge) mobileBadge.hidden = true;
   // Scroll itinerary to top
   document.getElementById('itinerary-container')?.scrollTo({ top: 0, behavior: 'smooth' });
+  requestAnimationFrame(() => { if (_map) _map.invalidateSize(); });
 }
 
 function exitSplitView() {
@@ -921,26 +1017,82 @@ async function handleRecordingStop() {
    TTS & UI HELPERS
    ══════════════════════════════════════════════════════════════════════════════ */
 
-const btnStopTTS = document.getElementById('btn-stop-tts');
+const ttsControls = document.getElementById('tts-controls');
+const btnStopTTS  = document.getElementById('btn-stop-tts');
+const btnPlayTTS  = document.getElementById('btn-play-tts');
 
-function playTTS(url) {
-  ttsAudio.src = url;
-  ttsAudio.play().catch(() => {});
-  btnStopTTS.hidden = false;
+let _ttsStopped = false;  // true only when user explicitly stops
+let _ttsGeneration = 0;   // tracks which request's audio we should play
+
+function showTTSControls(playing) {
+  ttsControls.hidden = false;
+  btnStopTTS.hidden = !playing;
+  btnPlayTTS.hidden = playing;
 }
 
-function stopTTS() {
-  ttsAudio.pause();
-  ttsAudio.src = '';
+function hideTTSControls() {
+  ttsControls.hidden = true;
   btnStopTTS.hidden = true;
+  btnPlayTTS.hidden = true;
 }
 
-ttsAudio.addEventListener('ended', () => { btnStopTTS.hidden = true; });
-ttsAudio.addEventListener('pause', () => { btnStopTTS.hidden = true; });
+function playTTS(url, gen) {
+  // Ignore stale audio from a previous request
+  if (gen !== undefined && gen !== _ttsGeneration) return;
+  if (!url) return;
+  _ttsStopped = false;
+  ttsAudio.preload = 'auto';
+  ttsAudio.src = url;
+  ttsAudio.play().catch((err) => {
+    console.warn('TTS play blocked:', err);
+    hideTTSControls();
+  });
+  showTTSControls(true);
+}
+
+function stopTTS(clearSrc = true) {
+  _ttsStopped = true;
+  ttsAudio.pause();
+  if (clearSrc) {
+    ttsAudio.src = '';
+    hideTTSControls();
+  } else {
+    // Pause only — show Play button for resume
+    showTTSControls(false);
+  }
+}
+
+function resumeTTS() {
+  if (!ttsAudio.src || ttsAudio.ended) return;
+  _ttsStopped = false;
+  ttsAudio.play().catch((err) => {
+    console.warn('TTS resume blocked:', err);
+    hideTTSControls();
+  });
+  showTTSControls(true);
+}
+
+ttsAudio.addEventListener('ended', () => { hideTTSControls(); });
+ttsAudio.addEventListener('error', () => {
+  console.warn('TTS audio failed to load:', ttsAudio.src);
+  ttsAudio.src = '';
+  hideTTSControls();
+});
+ttsAudio.addEventListener('playing', () => {
+  if (!_ttsStopped) showTTSControls(true);
+});
+ttsAudio.addEventListener('pause', () => {
+  if (_ttsStopped && ttsAudio.src && !ttsAudio.ended) showTTSControls(false);
+});
 btnStopTTS.addEventListener('click', (e) => {
   e.stopPropagation();
   e.preventDefault();
-  stopTTS();
+  stopTTS(false);  // pause only, allow resume
+});
+btnPlayTTS.addEventListener('click', (e) => {
+  e.stopPropagation();
+  e.preventDefault();
+  resumeTTS();
 });
 
 let _typingCounter = 0;
@@ -954,19 +1106,95 @@ function appendTyping() {
     <div class="message__bubble">
       <div class="typing-dots"><span></span><span></span><span></span></div>
       <div class="typing-status"></div>
+      <div class="trace-steps"></div>
     </div>`;
   messagesEl.appendChild(div);
   scrollToBottom();
   return id;
 }
 
+const _TRACE_COLLAPSE_THRESHOLD = 3;
+
+function _maybeCollapseTrace(stepsEl) {
+  /**Auto-collapse trace when done steps exceed threshold.
+   * Hides older steps behind a clickable "N tools completed" summary.
+   */
+  const doneSteps = stepsEl.querySelectorAll('.trace-step--done');
+  // Don't re-collapse if already collapsed
+  if (stepsEl.querySelector('.trace-collapsed') || doneSteps.length <= _TRACE_COLLAPSE_THRESHOLD) return;
+
+  // Wrap all but the last done step in a collapsible group
+  const toHide = Array.from(doneSteps).slice(0, -1);
+  const wrapper = document.createElement('div');
+  wrapper.className = 'trace-collapsed';
+  const toggle = document.createElement('div');
+  toggle.className = 'trace-collapse-toggle';
+  toggle.textContent = `${toHide.length} tools completed`;
+  toggle.addEventListener('click', () => {
+    const hidden = wrapper.querySelector('.trace-collapsed-items');
+    if (hidden) {
+      hidden.classList.toggle('trace-collapsed--open');
+      toggle.textContent = hidden.classList.contains('trace-collapsed--open')
+        ? `Hide ${toHide.length} tools`
+        : `${toHide.length} tools completed`;
+    }
+    scrollToBottom();
+  });
+  wrapper.appendChild(toggle);
+  const itemsWrap = document.createElement('div');
+  itemsWrap.className = 'trace-collapsed-items';
+  for (const s of toHide) itemsWrap.appendChild(s);
+  wrapper.appendChild(itemsWrap);
+  stepsEl.prepend(wrapper);
+}
+
 function updateTypingStatus(id, text) {
   const el = document.getElementById(id);
   if (!el) return;
+
+  // Tool result summary — append as a completed trace step
+  if (text.startsWith('result:')) {
+    const parts = text.split(':');
+    const toolName = parts[1] || '';
+    const summary = parts.slice(2).join(':');
+    const stepsEl = el.querySelector('.trace-steps');
+    if (stepsEl) {
+      // Mark previous active step as done
+      const prev = stepsEl.querySelector('.trace-step--active');
+      if (prev) {
+        prev.classList.remove('trace-step--active');
+        prev.classList.add('trace-step--done');
+      }
+      const step = document.createElement('div');
+      step.className = 'trace-step trace-step--done';
+      step.innerHTML = `<span class="trace-icon">&#10003;</span> <span class="trace-tool">${esc(toolName)}</span> <span class="trace-summary">${esc(summary)}</span>`;
+      stepsEl.appendChild(step);
+      _maybeCollapseTrace(stepsEl);
+    }
+    scrollToBottom();
+    return;
+  }
+
+  // Regular progress — show as active step
   const statusEl = el.querySelector('.typing-status');
   if (statusEl) {
     statusEl.textContent = text;
     statusEl.style.display = text ? 'block' : 'none';
+  }
+
+  // Also add as active trace step for tool calls
+  const stepsEl = el.querySelector('.trace-steps');
+  if (stepsEl && (text.startsWith('Searching') || text.startsWith('Checking weather') || text.startsWith('Saving') || text.startsWith('Remembering'))) {
+    // Mark previous active step as done
+    const prev = stepsEl.querySelector('.trace-step--active');
+    if (prev) {
+      prev.classList.remove('trace-step--active');
+      prev.classList.add('trace-step--done');
+    }
+    const step = document.createElement('div');
+    step.className = 'trace-step trace-step--active';
+    step.innerHTML = `<span class="trace-icon trace-spinner"></span> ${esc(text)}`;
+    stepsEl.appendChild(step);
   }
   scrollToBottom();
 }
@@ -1019,6 +1247,12 @@ function applyTheme(theme) {
   document.documentElement.setAttribute('data-theme', theme);
   localStorage.setItem('travelai_theme', theme);
   themeIcon.textContent = theme === 'light' ? '🌙' : '☀';
+  // Update map tiles to match theme
+  if (typeof _mapTileLayer !== 'undefined' && _mapTileLayer) {
+    _mapTileLayer.setUrl(theme === 'light'
+      ? 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png'
+      : 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png');
+  }
 }
 
 btnTheme.addEventListener('click', () => {
@@ -1067,10 +1301,11 @@ function renderMemories(memories) {
   memoryCount.hidden = false;
   memoryListEl.innerHTML = memories.map(m => `
     <div class="memory-item" data-id="${esc(m.id)}">
-      <span class="memory-text">${esc(m.text)}</span>
+      <span class="memory-text" title="Click to edit">${esc(m.text)}</span>
       <button class="memory-delete" data-id="${esc(m.id)}" title="Forget">&times;</button>
     </div>
   `).join('');
+  // Delete buttons
   memoryListEl.querySelectorAll('.memory-delete').forEach(btn => {
     btn.addEventListener('click', async (e) => {
       e.stopPropagation();
@@ -1079,6 +1314,45 @@ function renderMemories(memories) {
         await fetch(`/memories/${id}`, { method: 'DELETE' });
         loadMemoriesUI();
       } catch (_) {}
+    });
+  });
+  // Inline edit — click text to edit
+  memoryListEl.querySelectorAll('.memory-text').forEach(span => {
+    span.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const item = span.closest('.memory-item');
+      const id = item.dataset.id;
+      const oldText = span.textContent;
+      // Replace with input
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.className = 'memory-edit-input';
+      input.value = oldText;
+      span.replaceWith(input);
+      input.focus();
+      input.select();
+
+      async function commitEdit() {
+        const newText = input.value.trim();
+        if (!newText || newText === oldText) {
+          loadMemoriesUI();
+          return;
+        }
+        try {
+          await fetch(`/memories/${id}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text: newText }),
+          });
+          loadMemoriesUI();
+        } catch (_) { loadMemoriesUI(); }
+      }
+
+      input.addEventListener('blur', commitEdit);
+      input.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Enter') { ev.preventDefault(); input.blur(); }
+        if (ev.key === 'Escape') { loadMemoriesUI(); }
+      });
     });
   });
 }
@@ -1113,12 +1387,230 @@ function printItinerary() {
 if (btnPrintItin) btnPrintItin.addEventListener('click', printItinerary);
 
 /* ══════════════════════════════════════════════════════════════════════════════
+   ITINERARY MAP (Leaflet + Nominatim geocoding)
+   ══════════════════════════════════════════════════════════════════════════════ */
+
+const DAY_COLORS = ['#2f81f7','#3fb950','#d29922','#f85149','#a371f7','#e07c38','#56d4dd','#db61a2'];
+
+function _destroyMap() {
+  if (_map) { _map.remove(); _map = null; _mapTileLayer = null; _mapLegend = null; }
+  _mapMarkers = [];
+  _mapLines = [];
+}
+
+function _initMap() {
+  _destroyMap();
+  const el = document.getElementById('itinerary-map');
+  if (!el) return;
+  const theme = document.documentElement.getAttribute('data-theme') || 'dark';
+  _map = L.map(el, { zoomControl: true, scrollWheelZoom: true });
+  _mapTileLayer = L.tileLayer(
+    theme === 'light'
+      ? 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png'
+      : 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+    { attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/">CARTO</a>', maxZoom: 19 }
+  ).addTo(_map);
+}
+
+function _numberedIcon(num, color) {
+  return L.divIcon({
+    className: '',
+    html: `<div style="background:${color};color:#fff;width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;box-shadow:0 2px 8px rgba(0,0,0,.35);border:2.5px solid #fff;font-family:Inter,sans-serif">${num}</div>`,
+    iconSize: [28, 28],
+    iconAnchor: [14, 14],
+    popupAnchor: [0, -16],
+  });
+}
+
+async function _geocode(query) {
+  if (_geocodeCache[query] !== undefined) return _geocodeCache[query];
+
+  // Try English first (best for international place names on OSM)
+  const result = await _geocodeOnce(query, 'en');
+  if (result) { _geocodeCache[query] = result; return result; }
+
+  // Fallback: try with Chinese locale + country code (helps for Chinese POIs)
+  const hasCJK = /[\u4e00-\u9fff]/.test(query);
+  if (!hasCJK) {
+    // If query is English, also try without accept-language (raw OSM)
+    const raw = await _geocodeOnce(query, '');
+    if (raw) { _geocodeCache[query] = raw; return raw; }
+  } else {
+    const cn = await _geocodeOnce(query, 'zh', 'cn');
+    if (cn) { _geocodeCache[query] = cn; return cn; }
+  }
+
+  // Don't cache failures — transient errors shouldn't permanently block retries
+  return null;
+}
+
+async function _geocodeOnce(query, lang, countrycode) {
+  try {
+    let url = `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(query)}`;
+    if (lang) url += `&accept-language=${lang}`;
+    if (countrycode) url += `&countrycodes=${countrycode}`;
+    const res = await fetch(url);
+    const data = await res.json();
+    if (data.length) {
+      return { lat: parseFloat(data[0].lat), lng: parseFloat(data[0].lon) };
+    }
+  } catch (_) {}
+  return null;
+}
+
+/** Haversine distance in km between two {lat, lng} objects. */
+function _haversineDist(a, b) {
+  const R = 6371;
+  const toRad = d => d * Math.PI / 180;
+  const dLat = toRad(b.lat - a.lat);
+  const dLng = toRad(b.lng - a.lng);
+  const s = Math.sin(dLat / 2) ** 2
+          + Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(s), Math.sqrt(1 - s));
+}
+
+async function updateItineraryMap(itinerary) {
+  if (!itinerary) {
+    _destroyMap();
+    return;
+  }
+
+  const gen = ++_mapGeneration;
+  // Clear geocode cache to avoid stale null entries from prior rate-limit failures
+  for (const key in _geocodeCache) delete _geocodeCache[key];
+  const loadingEl = document.getElementById('map-loading');
+  if (loadingEl) loadingEl.hidden = false;
+
+  // Give container a frame to get dimensions
+  await new Promise(r => requestAnimationFrame(r));
+  _initMap();
+  if (!_map) return;
+
+  const dest = itinerary.destination || '';
+
+  // ── Phase 1: Collect all geocode queries upfront ──
+  // Always anchor queries to the destination city to prevent Nominatim
+  // from resolving ambiguous place names to the wrong country.
+  const tasks = []; // { dayIdx, actIdx, queries: string[] }
+  for (const [dayIdx, day] of (itinerary.days || []).entries()) {
+    for (const [actIdx, act] of (day.activities || []).entries()) {
+      const queries = [];
+      const addr = act.address || '';
+      const addrIsDest = !addr || addr === dest;
+      // Primary: place + address + destination (triple anchor)
+      if (!addrIsDest) {
+        queries.push(`${act.place}, ${addr}, ${dest}`);
+      }
+      // Fallback: place + destination (always included)
+      queries.push(`${act.place}, ${dest}`);
+      // Last resort: place name alone
+      queries.push(act.place);
+      tasks.push({ dayIdx, actIdx, queries });
+    }
+  }
+
+  // ── Phase 2: Geocode destination first for sanity checking ──
+  const destCoord = dest ? await _geocode(dest) : null;
+
+  // ── Phase 3: Geocode activities with rate limiting, trying fallbacks ──
+  const resolved = []; // { dayIdx, actIdx, coord }
+  for (const task of tasks) {
+    if (gen !== _mapGeneration) return;
+    let coord = null;
+    for (const q of task.queries) {
+      if (_geocodeCache[q] !== undefined) {
+        coord = _geocodeCache[q];
+        if (coord) break;
+        continue;
+      }
+      await new Promise(r => setTimeout(r, 1100));
+      coord = await _geocode(q);
+      if (coord) break;
+    }
+    // Sanity check: reject coordinates >300km from destination (wrong country)
+    if (coord && destCoord && _haversineDist(coord, destCoord) > 800) {
+      console.warn('Geocode outlier rejected:', task.queries[0], coord);
+      coord = null;
+    }
+    if (coord) resolved.push({ ...task, coord });
+  }
+
+  if (gen !== _mapGeneration || !_map) return;
+
+  // ── Phase 4: Place all markers and lines at once (no jank) ──
+  const allCoords = [];
+  const dayLabels = [];
+  const dayBuckets = {}; // dayIdx → coords[]
+  let actNum = 0;
+
+  for (const r of resolved) {
+    const day = itinerary.days[r.dayIdx];
+    const act = day.activities[r.actIdx];
+    const color = DAY_COLORS[r.dayIdx % DAY_COLORS.length];
+    actNum++;
+
+    if (!dayBuckets[r.dayIdx]) {
+      dayBuckets[r.dayIdx] = [];
+      dayLabels.push({ label: day.date || `Day ${r.dayIdx + 1}`, color });
+    }
+
+    const marker = L.marker([r.coord.lat, r.coord.lng], { icon: _numberedIcon(actNum, color) })
+      .bindPopup(`<strong>${esc(act.time || '')} — ${esc(act.place || '')}</strong><br><span style="opacity:.7">${esc(act.description || '').slice(0, 120)}</span>`)
+      .addTo(_map);
+    _mapMarkers.push(marker);
+    dayBuckets[r.dayIdx].push([r.coord.lat, r.coord.lng]);
+    allCoords.push([r.coord.lat, r.coord.lng]);
+  }
+
+  // Day route lines
+  for (const dayIdx of Object.keys(dayBuckets)) {
+    const coords = dayBuckets[dayIdx];
+    if (coords.length > 1 && _map) {
+      const color = DAY_COLORS[dayIdx % DAY_COLORS.length];
+      const line = L.polyline(coords, {
+        color, weight: 3, opacity: 0.65, dashArray: '8 5',
+      }).addTo(_map);
+      _mapLines.push(line);
+    }
+  }
+
+  if (gen !== _mapGeneration || !_map) return;
+  if (loadingEl) loadingEl.hidden = true;
+
+  // Final fit
+  if (allCoords.length > 0) {
+    _map.fitBounds(allCoords, { padding: [40, 40], maxZoom: 15 });
+  } else if (destCoord && _map) {
+    _map.setView([destCoord.lat, destCoord.lng], 12);
+    if (loadingEl) loadingEl.hidden = true;
+  }
+
+  // Day color legend
+  if (dayLabels.length > 1 && _map) {
+    const Legend = L.Control.extend({
+      options: { position: 'bottomleft' },
+      onAdd() {
+        const div = L.DomUtil.create('div', 'map-legend');
+        div.innerHTML = dayLabels.map(d =>
+          `<span class="map-legend-item"><span class="map-legend-dot" style="background:${d.color}"></span>${esc(d.label)}</span>`
+        ).join('');
+        return div;
+      }
+    });
+    _mapLegend = new Legend();
+    _map.addControl(_mapLegend);
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════════════════════
    IMAGE UPLOAD & PASTE
    ══════════════════════════════════════════════════════════════════════════════ */
 
 function clearPendingImage() {
   pendingImageId = null;
   pendingImageUrl = null;
+  const active = getActiveTrip();
+  if (active) { active.imageId = null; active.imagePreview = null; }
   imagePreviewBar.hidden = true;
   imagePreviewThumb.src = '';
   imageInput.value = '';
@@ -1135,6 +1627,11 @@ async function uploadImageFile(file) {
     const data = await res.json();
     pendingImageId = data.image_id;
     pendingImageUrl = data.url;
+    const active = getActiveTrip();
+    if (active) {
+      active.imageId = data.image_id;
+      active.imagePreview = data.url;
+    }
     imagePreviewThumb.src = data.url;
     imagePreviewBar.hidden = false;
     inputText.focus();
@@ -1206,6 +1703,10 @@ function migrateTrip(trip) {
     delete trip.itinerary;
   }
   if (!trip.itineraries) trip.itineraries = [];
+  // Reset transient generation state on page reload (SSE connection is gone)
+  trip.isGenerating = false;
+  trip.lastProgress = '';
+  delete trip._typingId;
 
   if (Array.isArray(trip.messages)) return trip;
   const messages = [

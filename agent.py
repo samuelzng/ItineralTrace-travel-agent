@@ -4,6 +4,7 @@ import concurrent.futures
 import json
 import logging
 import threading
+import time as _time
 from collections.abc import Callable
 from datetime import date
 from google import genai
@@ -15,6 +16,8 @@ from user_memory import load_preferences, format_preferences_for_prompt, format_
 logger = logging.getLogger(__name__)
 
 MODEL = "gemini-3.1-flash-lite-preview"
+# MODEL = 'gemini-3-flash-preview'
+
 MAX_ITERATIONS = 15
 
 _SYSTEM_PROMPT_TEMPLATE = """You are an expert AI travel planning agent. You create detailed, realistic, high-quality itineraries.
@@ -269,6 +272,55 @@ _TOOL_PROGRESS: dict[str, Callable[[dict], str]] = {
 }
 
 
+def _tool_result_summary(name: str, result: dict) -> str:
+    """One-line summary of a tool result for the trace UI."""
+    if "error" in result:
+        return f"Error: {result['error'][:80]}"
+    if name == "search_places":
+        places = result.get("places", [])
+        names = [p.get("name", "?") for p in places[:3]]
+        more = f" +{len(places) - 3} more" if len(places) > 3 else ""
+        return f"Found {len(places)} places: {', '.join(names)}{more}"
+    if name == "get_weather":
+        daily = result.get("daily", [])
+        if daily:
+            d0 = daily[0]
+            return f"{len(daily)}-day forecast: {d0.get('condition', '?')}, {d0.get('temp_low', '?')}-{d0.get('temp_high', '?')}°C"
+        return "No forecast data"
+    if name == "save_user_preferences":
+        return "Preferences saved"
+    if name == "save_memory":
+        return "Memory saved"
+    return "Done"
+
+
+def _extract_destination_from_history(history: list) -> str | None:
+    """Scan conversation history for a destination mentioned in prior turns."""
+    # Look through model responses for itinerary JSON with a destination field
+    for content in reversed(history):
+        if getattr(content, 'role', None) != 'model':
+            continue
+        for part in getattr(content, 'parts', []):
+            text = getattr(part, 'text', None) or ""
+            if '"destination"' in text:
+                import re as _re
+                m = _re.search(r'"destination"\s*:\s*"([^"]+)"', text)
+                if m:
+                    return m.group(1)
+    # Fallback: scan user messages for common patterns like "trip to X"
+    for content in reversed(history):
+        if getattr(content, 'role', None) != 'user':
+            continue
+        for part in getattr(content, 'parts', []):
+            text = getattr(part, 'text', None) or ""
+            if text:
+                import re as _re
+                m = _re.search(r'(?:trip to|travel to|visit|going to|plan.*for)\s+([A-Z][a-zA-Z\s,]+)', text)
+                if m:
+                    return m.group(1).strip().rstrip(',.')
+    return None
+
+
 def _pick_initial_progress(user_message: str, history: list) -> str:
     """Choose a contextual initial progress message based on conversation state."""
     msg = user_message.lower().strip()
@@ -326,9 +378,25 @@ def run_agent(
     )
 
     # Build user message parts (text + optional image)
-    user_parts = [types.Part(text=user_message)]
     if image_bytes:
-        user_parts.append(types.Part.from_bytes(data=image_bytes, mime_type=image_mime))
+        # Extract destination context from conversation history for better image recognition
+        dest_hint = _extract_destination_from_history(conversation_history)
+        if dest_hint:
+            image_context = (
+                f"{user_message}\n\n[Context: The user is planning a trip to {dest_hint}. "
+                f"Identify the landmark in this image relative to {dest_hint}.]"
+            )
+        else:
+            image_context = (
+                f"{user_message}\n\n[Identify the landmark or place in this image "
+                f"and tell the user its name and location.]"
+            )
+        user_parts = [
+            types.Part(text=image_context),
+            types.Part.from_bytes(data=image_bytes, mime_type=image_mime),
+        ]
+    else:
+        user_parts = [types.Part(text=user_message)]
 
     conversation_history.append(
         types.Content(role="user", parts=user_parts)
@@ -340,6 +408,10 @@ def run_agent(
             progress_callback("Analyzing your image...")
         else:
             progress_callback(_pick_initial_progress(user_message, conversation_history))
+
+    # Collect all search_places results to inject images into the final itinerary
+    # (LLM often drops image_url from JSON — we fix it in post-processing)
+    _all_place_images: dict[str, str] = {}  # normalized name → image_url
 
     for i in range(MAX_ITERATIONS):
         if cancel_event and cancel_event.is_set():
@@ -371,7 +443,6 @@ def run_agent(
                 err_str = str(e)
                 if "504" in err_str or "503" in err_str or "DEADLINE" in err_str or "overloaded" in err_str.lower():
                     logger.warning("Gemini transient error (attempt %d/3): %s", attempt + 1, e)
-                    import time as _time
                     _time.sleep(2 * (attempt + 1))
                     continue
                 raise
@@ -401,44 +472,70 @@ def run_agent(
             if not text:
                 logger.warning("Gemini returned empty text response")
                 return {"text": "I couldn't generate a response. Please try again.", "itinerary": None}
-            return _parse_final_response(text)
+            result = _parse_final_response(text)
+            # Post-process: inject image URLs that the LLM may have dropped
+            if result.get("itinerary") and _all_place_images:
+                _inject_images(result["itinerary"], _all_place_images)
+            return result
 
-        # Execute each function call and feed results back
+        # Execute all function calls in parallel for speed
         function_response_parts = []
+
+        # Send progress for all tools
         for part in function_calls:
             fc = part.function_call
-            args = dict(fc.args)
-            logger.info("Tool call: %s(%s)", fc.name, args)
-
-            # Send progress update
+            logger.info("Tool call: %s(%s)", fc.name, dict(fc.args))
             if progress_callback:
                 msg_fn = _TOOL_PROGRESS.get(fc.name, lambda a: f"Running {fc.name}")
-                progress_callback(msg_fn(args))
+                progress_callback(msg_fn(dict(fc.args)))
 
-            tool_fn = TOOL_REGISTRY.get(fc.name)
-            if tool_fn is None:
-                result = {"error": f"Unknown tool: {fc.name}"}
-            else:
-                try:
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                        future = executor.submit(tool_fn, **args)
+        # Submit all tool calls at once (use list to handle duplicate tool names)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(function_calls)) as executor:
+            futures = []
+            for part in function_calls:
+                fc = part.function_call
+                tool_fn = TOOL_REGISTRY.get(fc.name)
+                if tool_fn is None:
+                    futures.append(None)
+                else:
+                    futures.append(executor.submit(tool_fn, **dict(fc.args)))
+
+            for part, future in zip(function_calls, futures):
+                fc = part.function_call
+                if future is None:
+                    result = {"error": f"Unknown tool: {fc.name}"}
+                else:
+                    try:
                         result = future.result(timeout=15)
-                except concurrent.futures.TimeoutError:
-                    logger.error("Tool %s timed out after 15s", fc.name)
-                    result = {"error": "Tool timed out"}
-                except Exception as e:
-                    logger.error("Tool %s failed: %s", fc.name, e)
-                    result = {"error": str(e)}
+                    except concurrent.futures.TimeoutError:
+                        logger.error("Tool %s timed out after 15s", fc.name)
+                        result = {"error": "Tool timed out"}
+                    except Exception as e:
+                        logger.error("Tool %s failed: %s", fc.name, e)
+                        result = {"error": str(e)}
 
-            function_response_parts.append(
-                types.Part(function_response=types.FunctionResponse(
-                    name=fc.name,
-                    response=result,
-                ))
-            )
+                # Collect place images for post-processing
+                if fc.name == "search_places" and isinstance(result, dict):
+                    for p in result.get("places", []):
+                        img = p.get("image_url", "")
+                        name = p.get("name", "")
+                        if img and name:
+                            _all_place_images[name.strip().lower()] = img
 
-            if cancel_event and cancel_event.is_set():
-                raise AgentCancelled()
+                # Send result summary to UI for ReAct trace
+                if progress_callback and isinstance(result, dict):
+                    summary = _tool_result_summary(fc.name, result)
+                    progress_callback(f"result:{fc.name}:{summary}")
+
+                function_response_parts.append(
+                    types.Part(function_response=types.FunctionResponse(
+                        name=fc.name,
+                        response=result,
+                    ))
+                )
+
+        if cancel_event and cancel_event.is_set():
+            raise AgentCancelled()
 
         conversation_history.append(
             types.Content(role="user", parts=function_response_parts)
@@ -447,6 +544,53 @@ def run_agent(
     # Hit max iterations — return whatever we have
     logger.warning("Agent hit max iterations (%d)", MAX_ITERATIONS)
     return {"text": "I wasn't able to complete the request. Please try a simpler query.", "itinerary": None}
+
+
+def _inject_images(itinerary: dict, place_images: dict[str, str]) -> None:
+    """Fill in missing image_url fields by fuzzy-matching place names.
+
+    Uses word overlap for Latin text and substring matching for CJK text.
+    """
+    import re as _re
+    _cjk_re = _re.compile(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]')
+
+    for day in itinerary.get("days", []):
+        for act in day.get("activities", []):
+            if act.get("image_url"):
+                continue  # LLM already provided it
+            place_name = (act.get("place") or "").strip().lower()
+            if not place_name:
+                continue
+            # Exact match
+            if place_name in place_images:
+                act["image_url"] = place_images[place_name]
+                continue
+            # Substring / fuzzy match
+            has_cjk = bool(_cjk_re.search(place_name))
+            best_url, best_score = "", 0.0
+            place_words = set(place_name.split())
+            for key, url in place_images.items():
+                # Word overlap (works for Latin text)
+                key_words = set(key.split())
+                overlap = len(place_words & key_words)
+                score = float(overlap)
+                # CJK substring matching: check if key contains place or vice versa
+                if has_cjk:
+                    if place_name in key or key in place_name:
+                        score = max(score, 2.0)
+                    else:
+                        # Character overlap for CJK
+                        cjk_chars_place = set(_cjk_re.findall(place_name))
+                        cjk_chars_key = set(_cjk_re.findall(key))
+                        if cjk_chars_place and cjk_chars_key:
+                            char_overlap = len(cjk_chars_place & cjk_chars_key)
+                            if char_overlap >= 2:
+                                score = max(score, char_overlap * 0.8)
+                if score > best_score:
+                    best_score = score
+                    best_url = url
+            if best_score >= 1:
+                act["image_url"] = best_url
 
 
 def _parse_final_response(text: str) -> dict:
