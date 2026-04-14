@@ -15,8 +15,8 @@ from user_memory import load_preferences, format_preferences_for_prompt, format_
 
 logger = logging.getLogger(__name__)
 
-MODEL = "gemini-3.1-flash-lite-preview"
-# MODEL = 'gemini-3-flash-preview'
+# MODEL = "gemini-3.1-flash-lite-preview"
+MODEL = 'gemini-3-flash-preview'
 
 MAX_ITERATIONS = 15
 

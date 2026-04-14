@@ -27,6 +27,8 @@ let _mapLines = [];
 let _mapLegend = null;
 let _mapGeneration = 0;
 const _geocodeCache = {};
+let _lastResolvedCoords = [];  // [{dayIdx, actIdx, coord}] — cached for TSP optimization
+let _routeOptimized = false;   // whether the current itinerary has been optimized
 
 /* ── DOM refs ──────────────────────────────────────────────────────────────── */
 const messagesEl        = document.getElementById('messages');
@@ -452,9 +454,22 @@ function renderItinerary() {
     <div class="itinerary-map-wrap" id="itinerary-map-wrap">
       <div id="itinerary-map"></div>
       <div class="map-loading" id="map-loading">Placing pins on map…</div>
+      <button class="btn-optimize-route" id="btn-optimize-route" title="Optimize activity order to minimize travel distance (TSP)" hidden>
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h4v4H4zM16 16h4v4h-4zM16 4h4v4h-4zM4 16h4v4H4z"/><path d="M8 6h8M8 18h8M6 8v8M18 8v8" stroke-dasharray="2 2"/></svg>
+        <span>Optimize Route</span>
+      </button>
     </div>` + allHtml;
   if (exportActions) exportActions.hidden = false;
   updateItineraryMap(latest);
+
+  // Bind optimize route button
+  const optBtn = document.getElementById('btn-optimize-route');
+  if (optBtn) optBtn.addEventListener('click', () => {
+    if (_routeOptimized) return;
+    optBtn.disabled = true;
+    optBtn.querySelector('span').textContent = 'Optimizing…';
+    setTimeout(() => optimizeItineraryRoute(), 50);  // defer for UI update
+  });
 }
 
 function renderDay(day) {
@@ -895,6 +910,9 @@ function enterSplitView() {
   panels.itinerary.style.flex = '';
   itineraryBadge.hidden = true;
   if (mobileBadge) mobileBadge.hidden = true;
+  // Shift TTS controls left to avoid overlapping close button
+  const tts = document.getElementById('tts-controls');
+  if (tts) tts.classList.add('tts-split-offset');
   // Scroll itinerary to top
   document.getElementById('itinerary-container')?.scrollTo({ top: 0, behavior: 'smooth' });
   requestAnimationFrame(() => { if (_map) _map.invalidateSize(); });
@@ -906,6 +924,9 @@ function exitSplitView() {
   // Reset custom widths
   panels.chat.style.flex = '';
   panels.itinerary.style.flex = '';
+  // Reset TTS controls position
+  const tts = document.getElementById('tts-controls');
+  if (tts) tts.classList.remove('tts-split-offset');
 }
 
 /* ── Split handle drag ────────────────────────────────────────────────────── */
@@ -1469,6 +1490,190 @@ function _haversineDist(a, b) {
   return R * 2 * Math.atan2(Math.sqrt(s), Math.sqrt(1 - s));
 }
 
+/* ── TSP Optimization (Nearest Neighbor + 2-Opt) ─────────────────────────── */
+
+/** Build NxN distance matrix from coordinate array [{lat,lng}]. */
+function _buildDistMatrix(coords) {
+  const n = coords.length;
+  const dist = Array.from({ length: n }, () => new Float64Array(n));
+  for (let i = 0; i < n; i++)
+    for (let j = i + 1; j < n; j++) {
+      const d = _haversineDist(coords[i], coords[j]);
+      dist[i][j] = d;
+      dist[j][i] = d;
+    }
+  return dist;
+}
+
+/** Total path distance for a given order. */
+function _pathDist(order, dist) {
+  let total = 0;
+  for (let i = 0; i < order.length - 1; i++) total += dist[order[i]][order[i + 1]];
+  return total;
+}
+
+/** Nearest-neighbor heuristic for open TSP — tries every starting point. */
+function _nnTSP(dist) {
+  const n = dist.length;
+  if (n <= 2) return [...Array(n).keys()];
+  let bestOrder = null, bestDist = Infinity;
+  for (let start = 0; start < n; start++) {
+    const visited = new Set([start]);
+    const order = [start];
+    for (let step = 1; step < n; step++) {
+      let nearest = -1, nearestD = Infinity;
+      const last = order[order.length - 1];
+      for (let j = 0; j < n; j++) {
+        if (!visited.has(j) && dist[last][j] < nearestD) {
+          nearestD = dist[last][j];
+          nearest = j;
+        }
+      }
+      order.push(nearest);
+      visited.add(nearest);
+    }
+    const d = _pathDist(order, dist);
+    if (d < bestDist) { bestDist = d; bestOrder = order; }
+  }
+  return bestOrder;
+}
+
+/** 2-opt improvement on an open path (not a cycle). */
+function _improve2Opt(order, dist) {
+  const n = order.length;
+  if (n <= 3) return order;
+  let improved = true;
+  while (improved) {
+    improved = false;
+    for (let i = 0; i < n - 1; i++) {
+      for (let j = i + 2; j < n; j++) {
+        const a = order[i], b = order[i + 1], c = order[j], d2 = j + 1 < n ? order[j + 1] : -1;
+        const oldD = dist[a][b] + (d2 >= 0 ? dist[c][d2] : 0);
+        const newD = dist[a][c] + (d2 >= 0 ? dist[b][d2] : 0);
+        if (newD < oldD - 0.0001) {
+          // Reverse segment [i+1 .. j]
+          let lo = i + 1, hi = j;
+          while (lo < hi) { [order[lo], order[hi]] = [order[hi], order[lo]]; lo++; hi--; }
+          improved = true;
+        }
+      }
+    }
+  }
+  return order;
+}
+
+/** Estimate transport mode & duration from haversine distance. */
+function _estimateTransport(distKm) {
+  if (distKm < 1.5) return { mode: 'walk', duration: `${Math.round(distKm * 15)} min`, distance: `${distKm.toFixed(1)} km` };
+  if (distKm < 8)   return { mode: 'subway', duration: `${Math.round(distKm * 4)} min`, distance: `${distKm.toFixed(1)} km` };
+  if (distKm < 20)  return { mode: 'taxi', duration: `${Math.round(distKm * 3)} min`, distance: `${distKm.toFixed(1)} km` };
+  return { mode: 'taxi', duration: `${Math.round(distKm * 2.5)} min`, distance: `${distKm.toFixed(1)} km` };
+}
+
+/** Add minutes to a "HH:MM" time string. */
+function _addMinutes(timeStr, mins) {
+  const [h, m] = (timeStr || '09:00').split(':').map(Number);
+  const total = h * 60 + m + mins;
+  return `${String(Math.floor(total / 60) % 24).padStart(2, '0')}:${String(total % 60).padStart(2, '0')}`;
+}
+
+/**
+ * Optimize the current itinerary using TSP per day.
+ * Reorders activities to minimize total travel distance,
+ * recalculates transport estimates and reassigns times.
+ */
+function optimizeItineraryRoute() {
+  const trip = getActiveTrip();
+  if (!trip) return;
+  const itineraries = trip.itineraries || [];
+  if (!itineraries.length) return;
+  const itinerary = itineraries[itineraries.length - 1];
+  const resolved = _lastResolvedCoords;
+  if (!resolved.length) return;
+
+  let totalBefore = 0, totalAfter = 0;
+
+  for (const [dayIdx, day] of (itinerary.days || []).entries()) {
+    const acts = day.activities || [];
+    if (acts.length <= 2) continue;
+
+    // Get geocoded coords for this day's activities (in original order)
+    const dayResolved = resolved.filter(r => r.dayIdx === dayIdx).sort((a, b) => a.actIdx - b.actIdx);
+    if (dayResolved.length < 3) continue;
+
+    // Indices of activities that have coords
+    const geoIndices = dayResolved.map(r => r.actIdx);
+    const coords = dayResolved.map(r => r.coord);
+
+    // Distance before optimization
+    for (let i = 0; i < coords.length - 1; i++) totalBefore += _haversineDist(coords[i], coords[i + 1]);
+
+    // Solve TSP on the geocoded subset
+    const dist = _buildDistMatrix(coords);
+    let order = _nnTSP(dist);
+    order = _improve2Opt(order, dist);
+
+    // Distance after optimization
+    for (let i = 0; i < order.length - 1; i++) totalAfter += dist[order[i]][order[i + 1]];
+
+    // Build reordered activity list
+    const reorderedGeo = order.map(i => ({ act: acts[geoIndices[i]], coord: coords[i] }));
+    const geoSet = new Set(geoIndices);
+    const noCoordActs = acts.filter((_, i) => !geoSet.has(i));
+    const finalActs = [...reorderedGeo.map(r => r.act), ...noCoordActs];
+    const finalCoords = [...reorderedGeo.map(r => r.coord), ...noCoordActs.map(() => null)];
+
+    // Reassign times and transport based on new order
+    const startTime = acts[0]?.time || '09:00';
+    let currentTime = startTime;
+    for (let i = 0; i < finalActs.length; i++) {
+      finalActs[i].time = currentTime;
+      const dur = finalActs[i].duration_minutes || 60;
+
+      if (i < finalActs.length - 1 && finalCoords[i] && finalCoords[i + 1]) {
+        const d = _haversineDist(finalCoords[i], finalCoords[i + 1]);
+        finalActs[i].transport_to_next = _estimateTransport(d);
+        const transportMin = parseInt(finalActs[i].transport_to_next.duration) || 15;
+        currentTime = _addMinutes(currentTime, dur + transportMin);
+      } else if (i < finalActs.length - 1) {
+        finalActs[i].transport_to_next = null;
+        currentTime = _addMinutes(currentTime, dur + 15);
+      } else {
+        finalActs[i].transport_to_next = null;
+      }
+    }
+
+    day.activities = finalActs;
+  }
+
+  _routeOptimized = true;
+  // Persist & re-render
+  persistTrips();
+  renderItinerary();
+
+  // Show savings notification
+  const saved = totalBefore - totalAfter;
+  if (saved > 0.1) {
+    const pct = Math.round((saved / totalBefore) * 100);
+    _showOptimizeToast(`Route optimized! Saved ${saved.toFixed(1)} km (${pct}% shorter)`);
+  } else {
+    _showOptimizeToast('Route was already near-optimal!');
+  }
+}
+
+function _showOptimizeToast(msg) {
+  let toast = document.getElementById('optimize-toast');
+  if (!toast) {
+    toast = document.createElement('div');
+    toast.id = 'optimize-toast';
+    toast.className = 'optimize-toast';
+    document.body.appendChild(toast);
+  }
+  toast.textContent = msg;
+  toast.classList.add('show');
+  setTimeout(() => toast.classList.remove('show'), 3500);
+}
+
 async function updateItineraryMap(itinerary) {
   if (!itinerary) {
     _destroyMap();
@@ -1536,6 +1741,14 @@ async function updateItineraryMap(itinerary) {
   }
 
   if (gen !== _mapGeneration || !_map) return;
+
+  // Store resolved coords for TSP optimization
+  _lastResolvedCoords = resolved;
+  _routeOptimized = false;
+
+  // Show optimize button now that we have coords
+  const optBtn = document.getElementById('btn-optimize-route');
+  if (optBtn) optBtn.hidden = resolved.length < 3;
 
   // ── Phase 4: Place all markers and lines at once (no jank) ──
   const allCoords = [];

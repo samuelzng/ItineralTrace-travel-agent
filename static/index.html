@@ -7,7 +7,7 @@
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><path d='M2 14L28 2 18 30 14 18z' fill='%234285F4'/><path d='M28 2L14 18l4 12z' fill='%232563EB'/></svg>" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Playfair+Display:wght@600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/style.css?v=22" />
+  <link rel="stylesheet" href="/static/style.css?v=23" />
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 </head>
 <body>
@@ -114,12 +114,10 @@
     </div>
 
     <!-- Itinerary Panel -->
-    <section class="panel panel--hidden" id="panel-itinerary">
+    <section class="panel panel--hidden" id="panel-itinerary" style="position:relative">
+      <button class="btn-collapse-split" id="btn-collapse-split" title="Close split view">&times;</button>
       <header class="panel-header">
-        <div style="display:flex;align-items:center;gap:12px">
-          <h1 style="flex:1">Your Itinerary</h1>
-          <button class="btn-collapse-split" id="btn-collapse-split" title="Close split view">&times;</button>
-        </div>
+        <h1>Your Itinerary</h1>
         <p class="subtitle" id="itinerary-subtitle">No itinerary yet — ask me to plan a trip!</p>
         <div class="export-actions" id="export-actions" hidden>
           <button class="btn-export" id="btn-print-itinerary" title="Print / Save as PDF">🖨 Print</button>
@@ -180,6 +178,6 @@
   </div>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-  <script src="/static/app.js?v=22"></script>
+  <script src="/static/app.js?v=23"></script>
 </body>
 </html>

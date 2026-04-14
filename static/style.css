@@ -1329,9 +1329,13 @@ body { display: flex; }
   left: -4px; right: -4px;
 }
 
-/* Collapse button shown only in split mode */
+/* Collapse button — floats at top-right of itinerary panel in split mode */
 .btn-collapse-split {
   display: none;
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 60;
   width: 28px;
   height: 28px;
   border-radius: 50%;
@@ -1342,9 +1346,7 @@ body { display: flex; }
   cursor: pointer;
   align-items: center;
   justify-content: center;
-  flex-shrink: 0;
   transition: all var(--transition);
-  margin-left: auto;
 }
 .btn-collapse-split:hover {
   border-color: var(--danger);
@@ -1353,6 +1355,10 @@ body { display: flex; }
 }
 .main--split .btn-collapse-split {
   display: flex;
+}
+/* Shift TTS controls left so they don't overlap the close button in split mode */
+.tts-controls.tts-split-offset {
+  right: 52px;
 }
 
 @media (max-width: 900px) {
@@ -1471,6 +1477,61 @@ body { display: flex; }
   transition: opacity 0.3s ease;
 }
 .map-loading[hidden] { opacity: 0; pointer-events: none; }
+
+/* Optimize Route button — floating on the map */
+.btn-optimize-route {
+  position: absolute;
+  bottom: 12px;
+  right: 12px;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  font-family: var(--font);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 8px 14px;
+  border-radius: 99px;
+  cursor: pointer;
+  box-shadow: 0 2px 12px rgba(99,102,241,0.4);
+  transition: all var(--transition);
+}
+.btn-optimize-route:hover { background: #4f46e5; transform: scale(1.05); }
+.btn-optimize-route:disabled {
+  opacity: 0.6;
+  cursor: default;
+  transform: none;
+}
+.btn-optimize-route[hidden] { display: none; }
+.btn-optimize-route svg { flex-shrink: 0; }
+
+/* Optimize toast notification */
+.optimize-toast {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%) translateY(80px);
+  background: var(--bg-2);
+  color: var(--text);
+  border: 1px solid var(--accent);
+  font-family: var(--font);
+  font-size: 13px;
+  font-weight: 500;
+  padding: 10px 20px;
+  border-radius: 99px;
+  box-shadow: 0 4px 20px rgba(99,102,241,0.3);
+  z-index: 100;
+  opacity: 0;
+  transition: all 0.3s ease;
+  pointer-events: none;
+}
+.optimize-toast.show {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
 
 /* Leaflet popups themed */
 .leaflet-popup-content-wrapper {
