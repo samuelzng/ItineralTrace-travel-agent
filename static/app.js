@@ -173,11 +173,12 @@ function detectChips(content) {
   // Step 1: Agent asking for destination & days
   const asksWhere = /where.*go|where.*like to|what.*destination/.test(lower);
   const asksDays = /how many days|how long|number of days/.test(lower);
+  // Check days-only first — before cuisine/interest exclusion, since the agent
+  // may mention interests in the same message when the destination is already known.
+  if (asksDays && !asksWhere) {
+    return '__DAYS_ONLY_FORM__';
+  }
   if ((asksWhere || asksDays) && !/pace|relaxed|interest|cuisine/.test(lower)) {
-    if (asksDays && !asksWhere) {
-      // Agent already knows destination — only ask for days
-      return '__DAYS_ONLY_FORM__';
-    }
     return '__DESTINATION_FORM__';
   }
 
@@ -198,6 +199,18 @@ function detectChips(content) {
   return null;
 }
 
+function _todayStr() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function _buildDateRow() {
+  return `
+    <div class="inline-form-row">
+      <label>Start date</label>
+      <input type="text" class="inline-input inline-date-input" id="inline-start-date" value="${_todayStr()}" readonly />
+    </div>`;
+}
+
 function _buildDaysRow() {
   return `
     <div class="inline-form-row">
@@ -216,6 +229,7 @@ function _buildChipsOrForm(detected) {
   if (detected === '__DAYS_ONLY_FORM__') {
     return `
       <div class="inline-form" data-days-only="true">
+        ${_buildDateRow()}
         ${_buildDaysRow()}
         <button class="btn-inline-submit" id="inline-submit" disabled>Let's go</button>
       </div>`;
@@ -227,6 +241,7 @@ function _buildChipsOrForm(detected) {
           <label>Destination</label>
           <input type="text" class="inline-input" id="inline-dest" placeholder="e.g. Hong Kong, Tokyo, Paris" />
         </div>
+        ${_buildDateRow()}
         ${_buildDaysRow()}
         <button class="btn-inline-submit" id="inline-submit" disabled>Let's go</button>
       </div>`;
@@ -293,6 +308,26 @@ function buildAgentBubble(content, isLast) {
     const isDaysOnly = inlineForm.dataset.daysOnly === 'true';
     const destInput = inlineForm.querySelector('#inline-dest');  // null when days-only
     const daysInput = inlineForm.querySelector('#inline-days');  // null in combo forms
+    const dateInput = inlineForm.querySelector('#inline-start-date');
+    if (dateInput && typeof Pikaday !== 'undefined') {
+      new Pikaday({
+        field: dateInput,
+        format: 'YYYY-MM-DD',
+        minDate: new Date(),
+        defaultDate: new Date(),
+        setDefaultDate: true,
+        toString(date) {
+          const y = date.getFullYear();
+          const m = String(date.getMonth() + 1).padStart(2, '0');
+          const d = String(date.getDate()).padStart(2, '0');
+          return `${y}-${m}-${d}`;
+        },
+        parse(dateString) {
+          const parts = dateString.split('-');
+          return new Date(parts[0], parts[1] - 1, parts[2]);
+        }
+      });
+    }
     const submitBtn = inlineForm.querySelector('#inline-submit');
 
     if (isCombo) {
@@ -355,14 +390,16 @@ function buildAgentBubble(content, isLast) {
       submitBtn.addEventListener('click', () => {
         const days = getDays();
         if (!days) return;
+        const startDate = dateInput ? dateInput.value : '';
+        const dateStr = startDate ? `, starting ${startDate}` : '';
         if (isDaysOnly) {
           inlineForm.remove();
-          sendMessage(`${days} day${days > 1 ? 's' : ''}`);
+          sendMessage(`${days} day${days > 1 ? 's' : ''}${dateStr}`);
         } else {
           const dest = destInput ? destInput.value.trim() : '';
           if (!dest) return;
           inlineForm.remove();
-          sendMessage(`${dest}, ${days} day${days > 1 ? 's' : ''}`);
+          sendMessage(`${dest}, ${days} day${days > 1 ? 's' : ''}${dateStr}`);
         }
       });
 
@@ -1012,23 +1049,28 @@ async function handleRecordingStop() {
   const formData = new FormData();
   formData.append('audio', blob, 'recording.webm');
 
-  setProcessing(true);
-  const typingId = appendTyping();
+  // Show a lightweight transcribing indicator on the input bar (don't lock send)
+  btnMic.disabled = true;
+  inputText.placeholder = 'Transcribing…';
 
   try {
     const res = await fetch('/transcribe', { method: 'POST', body: formData });
     if (!res.ok) throw new Error(`Transcription failed ${res.status}`);
     const { text } = await res.json();
-    removeTyping(typingId);
-    setProcessing(false);
-    if (text.trim()) { sendMessage(text.trim()); }
-    else {
+    btnMic.disabled = false;
+    inputText.placeholder = 'Ask me to plan your trip…';
+    if (text.trim()) {
+      const input = document.getElementById('input-text');
+      input.value = text.trim();
+      input.dispatchEvent(new Event('input'));
+      input.focus();
+    } else {
       const trip = getActiveTrip();
       if (trip) { trip.messages.push({ role: 'agent', content: "I couldn't hear anything. Please try again." }); renderAllMessages(); }
     }
   } catch (err) {
-    removeTyping(typingId);
-    setProcessing(false);
+    btnMic.disabled = false;
+    inputText.placeholder = 'Ask me to plan your trip…';
     const trip = getActiveTrip();
     if (trip) { trip.messages.push({ role: 'agent', content: `Transcription error: ${err.message}` }); renderAllMessages(); }
   }
@@ -1253,7 +1295,7 @@ inputText.addEventListener('input', () => {
 inputText.addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
 });
-btnSend.addEventListener('click', sendMessage);
+btnSend.addEventListener('click', () => sendMessage());
 btnNewTrip.addEventListener('click', createTrip);
 btnDeleteTrip.addEventListener('click', deleteActiveTrip);
 

@@ -16,6 +16,7 @@ from user_memory import load_preferences, format_preferences_for_prompt, format_
 logger = logging.getLogger(__name__)
 
 # MODEL = "gemini-3.1-flash-lite-preview"
+
 MODEL = 'gemini-3-flash-preview'
 
 MAX_ITERATIONS = 15
@@ -118,12 +119,14 @@ Step 1 — DESTINATION & DAYS:
   Then STOP and wait.
 
 Step 2 — PACE & INTERESTS (combine into ONE question, ONLY if no preferences saved):
-  "What pace do you prefer (relaxed, moderate, or packed), and what are you most interested in (history, food, nature, shopping, or a mix of everything)?"
-  Then STOP and wait.
+  *** THIS STEP IS MANDATORY when no preferences are saved. You MUST ask it even if you already know destination and days. ***
+  Ask: "What pace do you prefer (relaxed, moderate, or packed), and what are you most interested in (history, food, nature, shopping, or a mix of everything)?"
+  Then STOP and wait. Do NOT start planning yet.
   Parse BOTH answers from the user's single reply, then call save_user_preferences and IMMEDIATELY start planning.
 
 RULES:
 - MAXIMUM 2 questions before planning starts. Never more.
+- A reply that only gives days (e.g. "1 day", "3") is answering Step 1 only — you MUST still ask Step 2.
 - If the user says "just plan", "skip", "go ahead", "surprise me": IMMEDIATELY use defaults (moderate pace, mix of everything) and START PLANNING. Do NOT ask any more questions.
 - Do NOT ask about group size, budget, or dietary.
 - NEVER re-ask pace or interests if they are already in USER PREFERENCES.
@@ -441,7 +444,15 @@ def run_agent(
             except Exception as e:
                 last_err = e
                 err_str = str(e)
-                if "504" in err_str or "503" in err_str or "DEADLINE" in err_str or "overloaded" in err_str.lower():
+                is_transient = (
+                    "504" in err_str or "503" in err_str
+                    or "DEADLINE" in err_str
+                    or "overloaded" in err_str.lower()
+                    or "Connection reset" in err_str
+                    or "ConnectionResetError" in err_str
+                    or isinstance(e, (ConnectionResetError, ConnectionError, OSError))
+                )
+                if is_transient:
                     logger.warning("Gemini transient error (attempt %d/3): %s", attempt + 1, e)
                     _time.sleep(2 * (attempt + 1))
                     continue
