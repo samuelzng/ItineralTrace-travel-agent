@@ -17,6 +17,57 @@
 
 ---
 
+## Screenshots
+
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <img src="assets/screenshots/full-ui.png" alt="Full UI" width="60%"><br>
+      <strong>Plan at a Glance</strong><br>
+      <sub>Chat on the left, a rich visual itinerary on the right — every place backed by real search data and live photos.</sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="assets/screenshots/agent-thinking.png" alt="Agent Thinking" width="60%"><br>
+      <strong>Watch It Think</strong><br>
+      <sub>Live tool-call progress shows exactly which APIs the agent is querying — full transparency, zero hallucination.</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="50%">
+      <img src="assets/screenshots/voice.png" alt="Voice Input" width="50%"><br>
+      <strong>Just Talk</strong><br>
+      <sub>Tap the mic, describe your dream trip, and let Whisper handle the rest. The agent replies with both text and natural speech.</sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="assets/screenshots/vision.png" alt="Image Recognition" width="60%"><br>
+      <strong>Snap a Landmark</strong><br>
+      <sub>Paste or upload a photo — Gemini Vision identifies the spot and builds an itinerary around it, no typing needed.</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="50%">
+      <img src="assets/screenshots/interacts.png" alt="Interactive Cards" width="60%"><br>
+      <strong>No Clicks, Your Picks</strong><br>
+      <sub>Interactive tabs let you tap to select, input, or confirm stops — no more clicks on your keyboard.</sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="assets/screenshots/memory.png" alt="Memory Panel" width="60%"><br>
+      <strong>It Remembers You</strong><br>
+      <sub>Travel agents remember anything about you - You're a vegetarian or want more shoping and just feel free to say!</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" colspan="2">
+      <img src="assets/screenshots/dark-light.png" alt="Dark and Light Theme" width="50%"><br>
+      <strong>Your Vibe, Your Theme</strong><br>
+      <sub>Toggle between dark and light mode — your preference is remembered automatically.</sub>
+    </td>
+  </tr>
+</table>
+
+---
+---
+
 ## Overview
 
 **ItineraTrace** is a conversational travel planning agent that accepts **text, voice, and image** input and produces structured multi-day itineraries through grounded tool calls. It is built around a [ReAct](https://arxiv.org/abs/2210.03629) reasoning loop over Gemini Flash, with three external read-only tools (place search, weather, routing), a TTL-keyed in-memory cache, and a four-layer pipeline that keeps the browser, agent, tools, and renderer cleanly separated.
@@ -73,57 +124,6 @@ Built as a solo final project for **CSCI3280 — Introduction to Multimedia, CUH
 - Responsive layout with mobile bottom navigation
 - Floating stop button for TTS playback
 
----
-
-## Screenshots
-
-<table>
-  <tr>
-    <td align="center" width="50%">
-      <img src="assets/screenshots/full-ui.png" alt="Full UI" width="100%"><br>
-      <strong>Plan at a Glance</strong><br>
-      <sub>Chat on the left, a rich visual itinerary on the right — every place backed by real search data and live photos.</sub>
-    </td>
-    <td align="center" width="50%">
-      <img src="assets/screenshots/voice.png" alt="Voice Input" width="100%"><br>
-      <strong>Just Talk</strong><br>
-      <sub>Tap the mic, describe your dream trip, and let Whisper handle the rest. The agent replies with both text and natural speech.</sub>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="50%">
-      <img src="assets/screenshots/vision.png" alt="Image Recognition" width="100%"><br>
-      <strong>Snap a Landmark</strong><br>
-      <sub>Paste or upload a photo — Gemini Vision identifies the spot and builds an itinerary around it, no typing needed.</sub>
-    </td>
-    <td align="center" width="50%">
-      <img src="assets/screenshots/memory.png" alt="Memory Panel" width="100%"><br>
-      <strong>It Remembers You</strong><br>
-      <sub>Mention you're vegetarian or traveling with kids — the agent saves it and tailors every future recommendation.</sub>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="50%">
-      <img src="assets/screenshots/agent-thinking.png" alt="Agent Thinking" width="100%"><br>
-      <strong>Watch It Think</strong><br>
-      <sub>Live tool-call progress shows exactly which APIs the agent is querying — full transparency, zero hallucination.</sub>
-    </td>
-    <td align="center" width="50%">
-      <img src="assets/screenshots/mobile.png" alt="Mobile View" width="100%"><br>
-      <strong>Plan on the Go</strong><br>
-      <sub>Fully responsive layout with bottom navigation — plan your next trip from anywhere.</sub>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" colspan="2">
-      <img src="assets/screenshots/dark-light.png" alt="Dark and Light Theme" width="80%"><br>
-      <strong>Your Vibe, Your Theme</strong><br>
-      <sub>Toggle between dark and light mode — your preference is remembered automatically.</sub>
-    </td>
-  </tr>
-</table>
-
----
 
 ## Architecture
 
